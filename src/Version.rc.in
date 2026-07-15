@@ -1,0 +1,38 @@
+#include <windows.h>
+
+#define VERSION_NUM @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+#define VERSION_STR "@PROJECT_VERSION@.0\0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VERSION_NUM
+ PRODUCTVERSION VERSION_NUM
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104b0"
+        BEGIN
+            VALUE "CompanyName", "AviUtl2LaTeX contributors\0"
+            VALUE "FileDescription", "AviUtl2 LaTeX plugin\0"
+            VALUE "FileVersion", VERSION_STR
+            VALUE "LegalCopyright", "Copyright (c) AviUtl2LaTeX contributors\0"
+            VALUE "OriginalFilename", "AviUtl2LaTeX.auf2\0"
+            VALUE "ProductName", "AviUtl2LaTeX\0"
+            VALUE "ProductVersion", VERSION_STR
+            VALUE "BuildId", "@AVIUTL2_LATEX_BUILD_ID@\0"
+            VALUE "BuildTimestamp", "@AVIUTL2_LATEX_BUILD_TIMESTAMP@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END

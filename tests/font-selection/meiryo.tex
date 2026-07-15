@@ -1,0 +1,14 @@
+\documentclass{article}
+\usepackage{fontspec}
+\usepackage{luatexja}
+\usepackage{luatexja-fontspec}
+\setmainfont{Meiryo}
+\setmainjfont[
+  YokoFeatures={JFM=propw},
+  Kerning=On,
+  Script=Default,
+  RawFeature={+palt,+kern}
+]{Meiryo}
+\begin{document}
+日本語 ABC 123
+\end{document}

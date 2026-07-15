@@ -1,0 +1,105 @@
+name: Release package
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  AVIUTL2_SDK_VERSION: '2026-07-12'
+  AVIUTL2_SDK_URL: 'https://spring-fragrance.mints.ne.jp/aviutl/aviutl2_sdk.zip'
+  AVIUTL2_SDK_SHA256: '0A1462A1117FBDD0BDB5AAC53EB4F97514F8B920C9315769C4C28805A9E1FA74'
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag against CMake project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $match = [regex]::Match($cmake, 'project\(AviUtl2LaTeX VERSION ([0-9]+\.[0-9]+\.[0-9]+)')
+          if (-not $match.Success) { throw 'PROJECT_VERSION not found' }
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $version = $match.Groups[1].Value
+          if ($tag -ne $version) { throw "Tag $tag does not match PROJECT_VERSION $version" }
+      - name: Acquire official AviUtl2 SDK
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          ./.github/scripts/Acquire-AviUtl2Sdk.ps1 `
+            -Version $env:AVIUTL2_SDK_VERSION `
+            -SourceUrl $env:AVIUTL2_SDK_URL `
+            -ExpectedSha256 $env:AVIUTL2_SDK_SHA256 `
+            -Destination (Join-Path $env:GITHUB_WORKSPACE 'external/aviutl2_sdk') `
+            -ArchivePath (Join-Path $env:RUNNER_TEMP 'aviutl2_sdk.zip')
+      - name: Validate AviUtl2 SDK structure
+        shell: pwsh
+        run: |
+          $required = @(
+            'filter2.h',
+            'plugin2.h',
+            'aviutl2_plugin_sdk.txt',
+            'license.txt',
+            'MediaFilter.cpp',
+            'MediaObject.cpp'
+          )
+          foreach ($relativePath in $required) {
+            $path = Join-Path 'external/aviutl2_sdk' $relativePath
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required AviUtl2 SDK file is missing: $path"
+            }
+            Write-Host "Validated: $path"
+          }
+          Write-Host 'AviUtl2 SDK structure validation: success'
+      - name: Configure (MSVC x64)
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DBUILD_TESTING=ON
+          -DAVIUTL2_LATEX_DEPLOY_RUNTIME=OFF
+          -DAVIUTL2_LATEX_BUILD_ID=${{ github.sha }}
+          -DAVIUTL2_LATEX_BUILD_TIMESTAMP=${{ github.event.repository.updated_at }}
+      - name: Build Release
+        run: cmake --build build --config Release
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Build catalog package
+        run: cmake --build build --config Release --target package_catalog
+      - name: Verify catalog package excludes SDK and development files
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = Get-ChildItem -LiteralPath dist -Filter 'AviUtl2LaTeX-v*.zip' -File |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $zipPath) { throw 'Catalog ZIP was not generated.' }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $forbidden = @($archive.Entries | Where-Object {
+              $_.FullName -match '(^|/)(external|aviutl2_sdk|runtime|tools|logs|cache)(/|$)'
+            })
+            if ($forbidden.Count -ne 0) {
+              throw "Forbidden development files found in catalog ZIP: $($forbidden.FullName -join ', ')"
+            }
+            Write-Host "Catalog ZIP validation: success ($zipPath)"
+          } finally {
+            $archive.Dispose()
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AviUtl2LaTeX-catalog-package
+          path: |
+            dist/AviUtl2LaTeX-v*.zip
+            dist/AviUtl2LaTeX-v*.sha256
+      - name: Attach tag artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AviUtl2LaTeX-v*.zip
+            dist/AviUtl2LaTeX-v*.sha256
