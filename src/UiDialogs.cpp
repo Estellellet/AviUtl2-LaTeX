@@ -22,6 +22,7 @@
 
 #include "EnvironmentDiagnostics.h"
 #include "AppPaths.h"
+#include "DialogLayout.h"
 #include "LatexRenderer.h"
 #include "PluginInfo.h"
 #include "ToolSettings.h"
@@ -32,8 +33,6 @@ namespace {
 
 HWND dialog_owner = nullptr;
 
-constexpr int kEnvironmentClassAtom = 1;
-constexpr int kFontClassAtom = 2;
 constexpr int IDC_TEX_ENVIRONMENT = 100;
 constexpr int IDC_LUALATEX = 101;
 constexpr int IDC_BROWSE_LUALATEX = 102;
@@ -57,15 +56,128 @@ constexpr int IDC_INFO_CLOSE = 304;
 constexpr int IDC_INFO_STATUS = 305;
 constexpr UINT WM_APP_DIAGNOSTIC_FINISHED = WM_APP + 0x241;
 constexpr UINT_PTR IDT_DIAGNOSTIC_COMPLETION = 0x241;
+constexpr int kDialogWorkMargin = 12;
+constexpr DWORD kResizableDialogStyle =
+    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX;
 
-int scale(HWND window, int value) {
-    const UINT dpi = GetDpiForWindow(window);
-    return MulDiv(value, dpi == 0 ? 96 : static_cast<int>(dpi), 96);
+using SystemParametersInfoForDpiFunction = BOOL(WINAPI*)(
+    UINT, UINT, PVOID, UINT, UINT);
+using GetDpiForSystemFunction = UINT(WINAPI*)();
+
+UINT valid_window_dpi(HWND window, UINT fallback = dialog_layout::kDefaultDpi) {
+    const UINT dpi = window == nullptr ? 0 : GetDpiForWindow(window);
+    return dpi == 0 ? fallback : dpi;
 }
 
-int owner_scale(int value) {
-    const UINT dpi = dialog_owner != nullptr ? GetDpiForWindow(dialog_owner) : 96;
-    return MulDiv(value, dpi == 0 ? 96 : static_cast<int>(dpi), 96);
+HFONT create_dialog_font(UINT dpi) {
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto parameters_for_dpi =
+        reinterpret_cast<SystemParametersInfoForDpiFunction>(
+            user32 == nullptr ? nullptr :
+            GetProcAddress(user32, "SystemParametersInfoForDpi"));
+    if (parameters_for_dpi != nullptr && parameters_for_dpi(
+            SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+            dpi == 0 ? dialog_layout::kDefaultDpi : dpi)) {
+        return CreateFontIndirectW(&metrics.lfMessageFont);
+    }
+    if (!SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        return nullptr;
+    }
+    const auto get_system_dpi = reinterpret_cast<GetDpiForSystemFunction>(
+        user32 == nullptr ? nullptr : GetProcAddress(user32, "GetDpiForSystem"));
+    const UINT system_dpi = get_system_dpi == nullptr
+        ? dialog_layout::kDefaultDpi
+        : (std::max)(dialog_layout::kDefaultDpi, get_system_dpi());
+    metrics.lfMessageFont.lfHeight = MulDiv(
+        metrics.lfMessageFont.lfHeight,
+        static_cast<int>(dpi == 0 ? dialog_layout::kDefaultDpi : dpi),
+        static_cast<int>(system_dpi));
+    return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+BOOL CALLBACK apply_font_to_child(HWND child, LPARAM font_value) {
+    SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(font_value), TRUE);
+    return TRUE;
+}
+
+void replace_dialog_font(HWND window, HFONT& owned_font, UINT dpi) {
+    HFONT replacement = create_dialog_font(dpi);
+    if (replacement == nullptr) return;
+    EnumChildWindows(window, apply_font_to_child,
+        reinterpret_cast<LPARAM>(replacement));
+    HFONT previous = owned_font;
+    owned_font = replacement;
+    if (previous != nullptr) DeleteObject(previous);
+}
+
+int dialog_font_height(HWND window, HFONT font, UINT dpi) {
+    HDC dc = GetDC(window);
+    if (dc == nullptr) return dialog_layout::scale_for_dpi(16, dpi);
+    HGDIOBJ previous = nullptr;
+    if (font != nullptr) previous = SelectObject(dc, font);
+    TEXTMETRICW metrics{};
+    const bool measured = GetTextMetricsW(dc, &metrics) != FALSE;
+    if (previous != nullptr) SelectObject(dc, previous);
+    ReleaseDC(window, dc);
+    return measured ? metrics.tmHeight : dialog_layout::scale_for_dpi(16, dpi);
+}
+
+int measured_button_width(
+    HWND window, HFONT font, UINT dpi, const wchar_t* text, int minimum_logical) {
+    SIZE extent{};
+    HDC dc = GetDC(window);
+    HGDIOBJ previous = nullptr;
+    if (dc != nullptr && font != nullptr) previous = SelectObject(dc, font);
+    const bool measured = dc != nullptr && GetTextExtentPoint32W(
+        dc, text, static_cast<int>(wcslen(text)), &extent) != FALSE;
+    if (previous != nullptr) SelectObject(dc, previous);
+    if (dc != nullptr) ReleaseDC(window, dc);
+    const int measured_width = measured
+        ? extent.cx + dialog_layout::scale_for_dpi(24, dpi) : 0;
+    return (std::max)(
+        dialog_layout::scale_for_dpi(minimum_logical, dpi), measured_width);
+}
+
+void move_to_rect(HWND control, int left, int top, int width, int height) {
+    if (control == nullptr) return;
+    MoveWindow(control, left, top, (std::max)(1, width),
+        (std::max)(1, height), TRUE);
+}
+
+void apply_minmax_limits(
+    HWND window, MINMAXINFO& limits, SIZE minimum_logical, UINT dpi) {
+    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+    const DWORD extended = static_cast<DWORD>(
+        GetWindowLongPtrW(window, GWL_EXSTYLE));
+    const SIZE minimum_client{
+        dialog_layout::scale_for_dpi(minimum_logical.cx, dpi),
+        dialog_layout::scale_for_dpi(minimum_logical.cy, dpi)};
+    const SIZE minimum_window = dialog_layout::adjust_window_size_for_dpi(
+        minimum_client, style, extended, dpi);
+    const auto monitor = dialog_layout::get_nearest_monitor_work_area(window);
+    const LONG work_width = monitor.work.right - monitor.work.left;
+    const LONG work_height = monitor.work.bottom - monitor.work.top;
+    const int margin = dialog_layout::scale_for_dpi(kDialogWorkMargin, dpi);
+    limits.ptMinTrackSize.x = (std::min)(
+        minimum_window.cx, (std::max)(1L, work_width - margin * 2));
+    limits.ptMinTrackSize.y = (std::min)(
+        minimum_window.cy, (std::max)(1L, work_height - margin * 2));
+    limits.ptMaxTrackSize.x = (std::max)(1L, work_width);
+    limits.ptMaxTrackSize.y = (std::max)(1L, work_height);
+}
+
+dialog_layout::WindowPlacement reconcile_created_window(
+    HWND window, SIZE logical_client_size, DWORD style,
+    DWORD extended_style) {
+    auto placement = dialog_layout::calculate_initial_window_placement(
+        window, logical_client_size, style, extended_style, kDialogWorkMargin);
+    const RECT rect = placement.final_rect;
+    SetWindowPos(window, nullptr, rect.left, rect.top,
+        rect.right - rect.left, rect.bottom - rect.top,
+        SWP_NOACTIVATE | SWP_NOZORDER);
+    return placement;
 }
 
 std::wstring control_text(HWND control) {
@@ -126,6 +238,11 @@ struct EnvironmentWindow {
     std::jthread diagnostic_worker;
     std::shared_ptr<DiagnosticCompletion> diagnostic_completion;
     std::uint64_t diagnostic_generation = 0;
+    HFONT ui_font = nullptr;
+    UINT dpi = dialog_layout::kDefaultDpi;
+    int scroll_offset = 0;
+    int content_height = 0;
+    int content_viewport_height = 0;
     bool diagnostic_running = false;
     bool close_requested = false;
     bool done = false;
@@ -161,31 +278,167 @@ void request_environment_window_close(EnvironmentWindow& state) {
 }
 
 void position_environment_controls(EnvironmentWindow& state) {
-    const int margin = scale(state.window, 12);
-    const int label_width = scale(state.window, 110);
-    const int edit_width = scale(state.window, 390);
-    const int button_width = scale(state.window, 78);
-    const int row = scale(state.window, 30);
-    const int height = scale(state.window, 24);
-    auto move = [&](HWND control, int x, int y, int w, int h) {
-        MoveWindow(control, scale(state.window, x), scale(state.window, y),
-            scale(state.window, w), scale(state.window, h), TRUE);
+    RECT client{};
+    GetClientRect(state.window, &client);
+    const int client_width = (std::max)(1L, client.right - client.left);
+    const int client_height = (std::max)(1L, client.bottom - client.top);
+    const int margin = dialog_layout::scale_for_dpi(12, state.dpi);
+    const int gap = dialog_layout::scale_for_dpi(8, state.dpi);
+    const int font_height = dialog_font_height(
+        state.window, state.ui_font, state.dpi);
+    const int control_height = (std::max)(
+        dialog_layout::scale_for_dpi(24, state.dpi),
+        font_height + dialog_layout::scale_for_dpi(8, state.dpi));
+    const int button_height = (std::max)(
+        dialog_layout::scale_for_dpi(28, state.dpi),
+        font_height + dialog_layout::scale_for_dpi(10, state.dpi));
+    const int footer_height = button_height + margin * 2;
+    const int footer_top = (std::max)(0, client_height - footer_height);
+    state.content_viewport_height = (std::max)(1, footer_top);
+    const int content_width = (std::max)(1, client_width - margin * 2);
+    const bool narrow = client_width <
+        dialog_layout::scale_for_dpi(540, state.dpi);
+    const int browse_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"参照", 70);
+    const int detect_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"自動検出", 100);
+    const int diagnose_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"環境確認", 100);
+    const int minimum_diagnostic_height = dialog_layout::scale_for_dpi(
+        narrow ? 90 : 100, state.dpi);
+
+    struct Placement { HWND control; int x; int y; int width; int height; };
+    std::vector<Placement> placements;
+    auto add = [&](HWND control, int x, int y, int width, int height) {
+        placements.push_back(Placement{control, x, y, width, height});
     };
-    move(GetDlgItem(state.window, 1), 12, 14, 105, 24);
-    move(state.environment, 120, 12, 180, 200);
-    move(GetDlgItem(state.window, 2), 12, 47, 105, 24);
-    move(state.lualatex, 120, 44, 370, 24);
-    move(GetDlgItem(state.window, IDC_BROWSE_LUALATEX), 498, 44, 70, 24);
-    move(GetDlgItem(state.window, 3), 12, 79, 105, 24);
-    move(state.mutool, 120, 76, 370, 24);
-    move(GetDlgItem(state.window, IDC_BROWSE_MUTOOL), 498, 76, 70, 24);
-    move(GetDlgItem(state.window, IDC_AUTO_DETECT), 120, 110, 100, 26);
-    move(GetDlgItem(state.window, IDC_DIAGNOSE), 228, 110, 100, 26);
-    move(GetDlgItem(state.window, 4), 12, 145, 105, 24);
-    move(state.diagnostic, 120, 143, 448, 170);
-    move(GetDlgItem(state.window, IDC_SAVE), 410, 326, 76, 28);
-    move(GetDlgItem(state.window, IDC_CANCEL), 492, 326, 76, 28);
-    (void)margin; (void)label_width; (void)edit_width; (void)button_width; (void)row; (void)height;
+
+    int diagnostic_top = 0;
+    int diagnostic_x = margin;
+    int diagnostic_width = content_width;
+    if (!narrow) {
+        const int label_width = (std::min)(
+            dialog_layout::scale_for_dpi(105, state.dpi), content_width / 3);
+        const int input_x = margin + label_width + gap;
+        const int input_width = (std::max)(1,
+            client_width - margin - input_x);
+        int y = margin;
+        add(GetDlgItem(state.window, 1), margin, y, label_width, control_height);
+        add(state.environment, input_x, y,
+            (std::min)(input_width, dialog_layout::scale_for_dpi(190, state.dpi)),
+            control_height * 8);
+        y += control_height + gap;
+        const int path_width = (std::max)(1, input_width - browse_width - gap);
+        add(GetDlgItem(state.window, 2), margin, y, label_width, control_height);
+        add(state.lualatex, input_x, y, path_width, control_height);
+        add(GetDlgItem(state.window, IDC_BROWSE_LUALATEX),
+            input_x + path_width + gap, y, browse_width, control_height);
+        y += control_height + gap;
+        add(GetDlgItem(state.window, 3), margin, y, label_width, control_height);
+        add(state.mutool, input_x, y, path_width, control_height);
+        add(GetDlgItem(state.window, IDC_BROWSE_MUTOOL),
+            input_x + path_width + gap, y, browse_width, control_height);
+        y += control_height + gap;
+        add(GetDlgItem(state.window, IDC_AUTO_DETECT),
+            input_x, y, detect_width, button_height);
+        add(GetDlgItem(state.window, IDC_DIAGNOSE),
+            input_x + detect_width + gap, y, diagnose_width, button_height);
+        y += button_height + gap;
+        add(GetDlgItem(state.window, 4), margin, y, label_width, control_height);
+        diagnostic_top = y;
+        diagnostic_x = input_x;
+        diagnostic_width = input_width;
+    } else {
+        int y = margin;
+        add(GetDlgItem(state.window, 1), margin, y, content_width, control_height);
+        y += control_height;
+        add(state.environment, margin, y, content_width, control_height * 8);
+        y += control_height + gap;
+        add(GetDlgItem(state.window, 2), margin, y, content_width, control_height);
+        y += control_height;
+        const int path_width = (std::max)(1, content_width - browse_width - gap);
+        add(state.lualatex, margin, y, path_width, control_height);
+        add(GetDlgItem(state.window, IDC_BROWSE_LUALATEX),
+            margin + path_width + gap, y, browse_width, control_height);
+        y += control_height + gap;
+        add(GetDlgItem(state.window, 3), margin, y, content_width, control_height);
+        y += control_height;
+        add(state.mutool, margin, y, path_width, control_height);
+        add(GetDlgItem(state.window, IDC_BROWSE_MUTOOL),
+            margin + path_width + gap, y, browse_width, control_height);
+        y += control_height + gap;
+        add(GetDlgItem(state.window, IDC_AUTO_DETECT),
+            margin, y, detect_width, button_height);
+        add(GetDlgItem(state.window, IDC_DIAGNOSE),
+            margin + detect_width + gap, y, diagnose_width, button_height);
+        y += button_height + gap;
+        add(GetDlgItem(state.window, 4), margin, y, content_width, control_height);
+        y += control_height;
+        diagnostic_top = y;
+    }
+
+    const int diagnostic_height = (std::max)(minimum_diagnostic_height,
+        state.content_viewport_height - diagnostic_top - margin);
+    add(state.diagnostic, diagnostic_x, diagnostic_top,
+        diagnostic_width, diagnostic_height);
+    state.content_height = diagnostic_top + diagnostic_height + margin;
+    const int maximum_scroll = (std::max)(
+        0, state.content_height - state.content_viewport_height);
+    state.scroll_offset = (std::clamp)(
+        state.scroll_offset, 0, maximum_scroll);
+
+    SCROLLINFO scroll{sizeof(scroll)};
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    scroll.nMin = 0;
+    scroll.nMax = (std::max)(0, state.content_height - 1);
+    scroll.nPage = static_cast<UINT>(state.content_viewport_height);
+    scroll.nPos = state.scroll_offset;
+    SetScrollInfo(state.window, SB_VERT, &scroll, TRUE);
+
+    for (const auto& placement : placements) {
+        move_to_rect(placement.control, placement.x,
+            placement.y - state.scroll_offset,
+            placement.width, placement.height);
+    }
+
+    const int cancel_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"キャンセル", 76);
+    const int save_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"保存", 76);
+    const int buttons_width = save_width + gap + cancel_width;
+    const int button_y = footer_top + (footer_height - button_height) / 2;
+    const int button_x = (std::max)(margin,
+        client_width - margin - buttons_width);
+    move_to_rect(GetDlgItem(state.window, IDC_SAVE),
+        button_x, button_y, save_width, button_height);
+    move_to_rect(GetDlgItem(state.window, IDC_CANCEL),
+        button_x + save_width + gap, button_y, cancel_width, button_height);
+}
+
+void scroll_environment(EnvironmentWindow& state, int requested_position) {
+    const int maximum_scroll = (std::max)(
+        0, state.content_height - state.content_viewport_height);
+    const int position = (std::clamp)(requested_position, 0, maximum_scroll);
+    if (position == state.scroll_offset) return;
+    state.scroll_offset = position;
+    position_environment_controls(state);
+}
+
+void ensure_environment_control_visible(EnvironmentWindow& state, HWND control) {
+    if (control == nullptr || control == GetDlgItem(state.window, IDC_SAVE) ||
+        control == GetDlgItem(state.window, IDC_CANCEL)) return;
+    RECT rect{};
+    if (!GetWindowRect(control, &rect)) return;
+    MapWindowPoints(nullptr, state.window, reinterpret_cast<POINT*>(&rect), 2);
+    const int content_top = rect.top + state.scroll_offset;
+    const int content_bottom = rect.bottom + state.scroll_offset;
+    if (content_top < state.scroll_offset) {
+        scroll_environment(state, content_top);
+    } else if (content_bottom >
+            state.scroll_offset + state.content_viewport_height) {
+        scroll_environment(state,
+            content_bottom - state.content_viewport_height);
+    }
 }
 
 LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -198,6 +451,7 @@ LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPAR
     }
     if (state == nullptr) return DefWindowProcW(window, message, wparam, lparam);
     if (message == WM_CREATE) {
+        state->dpi = valid_window_dpi(window);
         auto make = [&](const wchar_t* klass, const wchar_t* text, DWORD style, int id) {
             return CreateWindowExW(0, klass, text, WS_CHILD | WS_VISIBLE | style,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
@@ -224,11 +478,66 @@ LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPAR
             ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, IDC_DIAGNOSTIC);
         make(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_SAVE);
         make(L"BUTTON", L"キャンセル", BS_PUSHBUTTON | WS_TABSTOP, IDC_CANCEL);
+        replace_dialog_font(window, state->ui_font, state->dpi);
         position_environment_controls(*state);
+        return 0;
+    }
+    if (message == WM_SIZE) {
+        position_environment_controls(*state);
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO) {
+        apply_minmax_limits(window,
+            *reinterpret_cast<MINMAXINFO*>(lparam), SIZE{420, 280}, state->dpi);
+        return 0;
+    }
+    if (message == WM_DPICHANGED) {
+        const UINT new_dpi = LOWORD(wparam) == 0
+            ? dialog_layout::kDefaultDpi : LOWORD(wparam);
+        const RECT suggested = *reinterpret_cast<const RECT*>(lparam);
+        const RECT final_rect = dialog_layout::clamp_dpi_changed_rect(
+            suggested, new_dpi, kDialogWorkMargin);
+        state->dpi = new_dpi;
+        SetWindowPos(window, nullptr, final_rect.left, final_rect.top,
+            final_rect.right - final_rect.left,
+            final_rect.bottom - final_rect.top,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        replace_dialog_font(window, state->ui_font, state->dpi);
+        position_environment_controls(*state);
+        return 0;
+    }
+    if (message == WM_VSCROLL) {
+        SCROLLINFO scroll{sizeof(scroll)};
+        scroll.fMask = SIF_ALL;
+        GetScrollInfo(window, SB_VERT, &scroll);
+        int next = state->scroll_offset;
+        const int line = dialog_layout::scale_for_dpi(28, state->dpi);
+        switch (LOWORD(wparam)) {
+        case SB_LINEUP: next -= line; break;
+        case SB_LINEDOWN: next += line; break;
+        case SB_PAGEUP: next -= state->content_viewport_height; break;
+        case SB_PAGEDOWN: next += state->content_viewport_height; break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK: next = scroll.nTrackPos; break;
+        case SB_TOP: next = 0; break;
+        case SB_BOTTOM: next = state->content_height; break;
+        default: return 0;
+        }
+        scroll_environment(*state, next);
+        return 0;
+    }
+    if (message == WM_MOUSEWHEEL) {
+        const int lines = GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA;
+        scroll_environment(*state, state->scroll_offset - lines *
+            dialog_layout::scale_for_dpi(36, state->dpi));
         return 0;
     }
     if (message == WM_COMMAND) {
         const int id = LOWORD(wparam);
+        if (lparam != 0) {
+            ensure_environment_control_visible(
+                *state, reinterpret_cast<HWND>(lparam));
+        }
         if (id == IDC_BROWSE_LUALATEX || id == IDC_BROWSE_MUTOOL) {
             const COMDLG_FILTERSPEC filters[] = {
                 {id == IDC_BROWSE_LUALATEX ? L"lualatex.exe" : L"mutool.exe",
@@ -343,7 +652,7 @@ LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPAR
             }
             return 0;
         }
-        if (id == IDC_SAVE) {
+        if (id == IDC_SAVE || id == IDOK) {
             ToolSettings value;
             value.tex_environment = static_cast<TexEnvironment>(SendMessageW(state->environment, CB_GETCURSEL, 0, 0));
             value.lualatex_path = control_text(state->lualatex);
@@ -362,7 +671,7 @@ LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPAR
             if (!save_tool_settings(value, error)) { SetWindowTextW(state->diagnostic, error.c_str()); return 0; }
             state->settings = std::move(value); state->done = true; DestroyWindow(window); return 0;
         }
-        if (id == IDC_CANCEL) {
+        if (id == IDC_CANCEL || id == IDCANCEL) {
             request_environment_window_close(*state);
             return 0;
         }
@@ -417,6 +726,10 @@ LRESULT CALLBACK environment_proc(HWND window, UINT message, WPARAM wparam, LPAR
         if (state->diagnostic_worker.joinable()) {
             state->diagnostic_worker.request_stop();
         }
+        if (state->ui_font != nullptr) {
+            DeleteObject(state->ui_font);
+            state->ui_font = nullptr;
+        }
         state->done = true;
         return 0;
     }
@@ -450,6 +763,8 @@ struct FontWindow {
     std::wstring preview_status;
     int preview_target_width = 0;
     int preview_target_height = 0;
+    HFONT ui_font = nullptr;
+    UINT dpi = dialog_layout::kDefaultDpi;
     std::wstring current;
     bool current_is_default = false;
     std::optional<SystemFontSelection> selected;
@@ -552,6 +867,33 @@ void load_system_fonts(FontWindow& state) {
 }
 
 std::wstring lower(std::wstring value) { for (auto& c : value) c = static_cast<wchar_t>(towlower(c)); return value; }
+
+void update_font_list_horizontal_extent(FontWindow& state) {
+    if (state.list == nullptr) return;
+    HDC dc = GetDC(state.list);
+    if (dc == nullptr) return;
+    HGDIOBJ previous = nullptr;
+    if (state.ui_font != nullptr) previous = SelectObject(dc, state.ui_font);
+    int maximum = 0;
+    const int count = static_cast<int>(SendMessageW(state.list, LB_GETCOUNT, 0, 0));
+    for (int index = 0; index < count; ++index) {
+        const int length = static_cast<int>(
+            SendMessageW(state.list, LB_GETTEXTLEN, index, 0));
+        if (length < 0) continue;
+        std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+        if (SendMessageW(state.list, LB_GETTEXT, index,
+                reinterpret_cast<LPARAM>(text.data())) == LB_ERR) continue;
+        SIZE extent{};
+        if (GetTextExtentPoint32W(dc, text.c_str(), length, &extent)) {
+            maximum = (std::max)(maximum, static_cast<int>(extent.cx));
+        }
+    }
+    if (previous != nullptr) SelectObject(dc, previous);
+    ReleaseDC(state.list, dc);
+    SendMessageW(state.list, LB_SETHORIZONTALEXTENT,
+        maximum + dialog_layout::scale_for_dpi(24, state.dpi), 0);
+}
+
 void refresh_font_list(FontWindow& state) {
     const std::wstring query = lower(control_text(state.search));
     SendMessageW(state.list, LB_RESETCONTENT, 0, 0); state.visible.clear();
@@ -570,6 +912,65 @@ void refresh_font_list(FontWindow& state) {
             _wcsicmp(font.display_name.c_str(), state.current.c_str()) == 0))) selected = static_cast<int>(row);
     }
     if (selected >= 0) SendMessageW(state.list, LB_SETCURSEL, selected, 0);
+    update_font_list_horizontal_extent(state);
+}
+
+void position_font_controls(FontWindow& state) {
+    RECT client{};
+    GetClientRect(state.window, &client);
+    const int client_width = (std::max)(1L, client.right - client.left);
+    const int client_height = (std::max)(1L, client.bottom - client.top);
+    const int margin = dialog_layout::scale_for_dpi(12, state.dpi);
+    const int gap = dialog_layout::scale_for_dpi(10, state.dpi);
+    const int font_height = dialog_font_height(
+        state.window, state.ui_font, state.dpi);
+    const int search_height = (std::max)(
+        dialog_layout::scale_for_dpi(25, state.dpi),
+        font_height + dialog_layout::scale_for_dpi(8, state.dpi));
+    const int button_height = (std::max)(
+        dialog_layout::scale_for_dpi(28, state.dpi),
+        font_height + dialog_layout::scale_for_dpi(10, state.dpi));
+    const int select_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"選択", 78);
+    const int cancel_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"キャンセル", 78);
+    const int footer_height = button_height + margin * 2;
+    const int footer_top = (std::max)(0, client_height - footer_height);
+    const int content_width = (std::max)(1, client_width - margin * 2);
+
+    move_to_rect(state.search, margin, margin, content_width, search_height);
+    const int body_top = margin + search_height + gap;
+    const int body_bottom = (std::max)(body_top + 1, footer_top - gap);
+    const int body_height = (std::max)(1, body_bottom - body_top);
+    const int minimum_list = dialog_layout::scale_for_dpi(90, state.dpi);
+    const int minimum_preview = dialog_layout::scale_for_dpi(64, state.dpi);
+    const int preferred_preview = dialog_layout::scale_for_dpi(145, state.dpi);
+    int preview_height = (std::clamp)(
+        preferred_preview, minimum_preview,
+        (std::max)(minimum_preview, body_height - minimum_list - gap));
+    if (body_height < minimum_list + minimum_preview + gap) {
+        preview_height = (std::max)(
+            dialog_layout::scale_for_dpi(40, state.dpi), body_height / 3);
+    }
+    preview_height = (std::min)(preview_height, (std::max)(1, body_height - 1));
+    const int list_height = (std::max)(1, body_height - preview_height - gap);
+    move_to_rect(state.list, margin, body_top, content_width, list_height);
+    move_to_rect(state.preview, margin, body_top + list_height + gap,
+        content_width, preview_height);
+
+    const int buttons_width = select_width + gap + cancel_width;
+    const int button_x = (std::max)(margin,
+        client_width - margin - buttons_width);
+    const int button_y = footer_top + (footer_height - button_height) / 2;
+    move_to_rect(GetDlgItem(state.window, IDC_FONT_SELECT),
+        button_x, button_y, select_width, button_height);
+    move_to_rect(GetDlgItem(state.window, IDC_FONT_CANCEL),
+        button_x + select_width + gap, button_y, cancel_width, button_height);
+    const int item_height = (std::max)(
+        font_height + dialog_layout::scale_for_dpi(5, state.dpi),
+        dialog_layout::scale_for_dpi(20, state.dpi));
+    SendMessageW(state.list, LB_SETITEMHEIGHT, 0, item_height);
+    update_font_list_horizontal_extent(state);
 }
 
 class BitmapTextRenderer final : public IDWriteTextRenderer {
@@ -871,24 +1272,58 @@ LRESULT CALLBACK font_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
     if (message == WM_NCCREATE) { state = reinterpret_cast<FontWindow*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams); state->window = window; SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state)); }
     if (!state) return DefWindowProcW(window, message, wparam, lparam);
     if (message == WM_CREATE) {
-        state->search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            scale(window, 12), scale(window, 12), scale(window, 430), scale(window, 25), window,
+        state->dpi = valid_window_dpi(window);
+        state->search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FONT_SEARCH)), GetModuleHandleW(nullptr), nullptr);
-        state->list = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY,
-            scale(window, 12), scale(window, 47), scale(window, 430), scale(window, 220), window,
+        state->list = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE |
+            WS_BORDER | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP | LBS_NOTIFY,
+            0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FONT_LIST)), GetModuleHandleW(nullptr), nullptr);
         state->preview = CreateWindowExW(0, L"AviUtl2LaTeX.FontPreview", L"",
             WS_CHILD | WS_VISIBLE,
-            scale(window, 12), scale(window, 278), scale(window, 430), scale(window, 145), window,
+            0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FONT_PREVIEW)),
             GetModuleHandleW(nullptr), state);
-        CreateWindowExW(0, L"BUTTON", L"選択", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            scale(window, 278), scale(window, 438), scale(window, 78), scale(window, 28), window,
+        CreateWindowExW(0, L"BUTTON", L"選択", WS_CHILD | WS_VISIBLE |
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+            0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FONT_SELECT)), GetModuleHandleW(nullptr), nullptr);
-        CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE,
-            scale(window, 364), scale(window, 438), scale(window, 78), scale(window, 28), window,
+        CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE |
+            WS_TABSTOP,
+            0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_FONT_CANCEL)), GetModuleHandleW(nullptr), nullptr);
-        refresh_font_list(*state); rebuild_font_preview(*state); return 0;
+        replace_dialog_font(window, state->ui_font, state->dpi);
+        position_font_controls(*state);
+        refresh_font_list(*state);
+        rebuild_font_preview(*state);
+        return 0;
+    }
+    if (message == WM_SIZE) {
+        position_font_controls(*state);
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO) {
+        apply_minmax_limits(window,
+            *reinterpret_cast<MINMAXINFO*>(lparam), SIZE{360, 330}, state->dpi);
+        return 0;
+    }
+    if (message == WM_DPICHANGED) {
+        const UINT new_dpi = LOWORD(wparam) == 0
+            ? dialog_layout::kDefaultDpi : LOWORD(wparam);
+        const RECT suggested = *reinterpret_cast<const RECT*>(lparam);
+        const RECT final_rect = dialog_layout::clamp_dpi_changed_rect(
+            suggested, new_dpi, kDialogWorkMargin);
+        state->dpi = new_dpi;
+        SetWindowPos(window, nullptr, final_rect.left, final_rect.top,
+            final_rect.right - final_rect.left,
+            final_rect.bottom - final_rect.top,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        replace_dialog_font(window, state->ui_font, state->dpi);
+        position_font_controls(*state);
+        rebuild_font_preview(*state);
+        return 0;
     }
     if (message == WM_COMMAND) {
         const int id = LOWORD(wparam), notification = HIWORD(wparam);
@@ -898,7 +1333,8 @@ LRESULT CALLBACK font_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         if (id == IDC_FONT_LIST && notification == LBN_SELCHANGE) {
             rebuild_font_preview(*state); return 0;
         }
-        if (id == IDC_FONT_SELECT || (id == IDC_FONT_LIST && notification == LBN_DBLCLK)) {
+        if (id == IDC_FONT_SELECT || id == IDOK ||
+            (id == IDC_FONT_LIST && notification == LBN_DBLCLK)) {
             const int row = static_cast<int>(SendMessageW(state->list, LB_GETCURSEL, 0, 0));
             if (row >= 0 && static_cast<std::size_t>(row) < state->visible.size()) {
                 const auto& entry = state->fonts[state->visible[static_cast<std::size_t>(row)]];
@@ -910,11 +1346,17 @@ LRESULT CALLBACK font_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             }
             DestroyWindow(window); return 0;
         }
-        if (id == IDC_FONT_CANCEL) { DestroyWindow(window); return 0; }
+        if (id == IDC_FONT_CANCEL || id == IDCANCEL) {
+            DestroyWindow(window); return 0;
+        }
     }
     if (message == WM_CLOSE) { DestroyWindow(window); return 0; }
     if (message == WM_DESTROY) {
         reset_font_preview(*state);
+        if (state->ui_font != nullptr) {
+            DeleteObject(state->ui_font);
+            state->ui_font = nullptr;
+        }
         state->done = true;
         return 0;
     }
@@ -928,6 +1370,8 @@ struct InformationWindow {
     HWND window = nullptr;
     HWND text = nullptr;
     HWND status = nullptr;
+    HFONT ui_font = nullptr;
+    UINT dpi = dialog_layout::kDefaultDpi;
     bool done = false;
 };
 
@@ -954,20 +1398,69 @@ bool copy_unicode_text(HWND owner, const std::wstring& text) {
 }
 
 void position_information_controls(InformationWindow& state) {
-    const int margin = scale(state.window, 12);
-    const int width = scale(state.window, 696);
-    const int text_height = scale(state.window, 456);
-    MoveWindow(state.text, margin, margin, width, text_height, TRUE);
-    MoveWindow(GetDlgItem(state.window, IDC_INFO_COPY), margin,
-        scale(state.window, 480), scale(state.window, 144), scale(state.window, 30), TRUE);
-    MoveWindow(GetDlgItem(state.window, IDC_INFO_LOG), scale(state.window, 164),
-        scale(state.window, 480), scale(state.window, 112), scale(state.window, 30), TRUE);
-    MoveWindow(GetDlgItem(state.window, IDC_INFO_LOG_FOLDER), scale(state.window, 284),
-        scale(state.window, 480), scale(state.window, 112), scale(state.window, 30), TRUE);
-    MoveWindow(GetDlgItem(state.window, IDC_INFO_CLOSE), scale(state.window, 608),
-        scale(state.window, 480), scale(state.window, 100), scale(state.window, 30), TRUE);
-    MoveWindow(state.status, margin, scale(state.window, 520), width,
-        scale(state.window, 24), TRUE);
+    RECT client{};
+    GetClientRect(state.window, &client);
+    const int client_width = (std::max)(1L, client.right - client.left);
+    const int client_height = (std::max)(1L, client.bottom - client.top);
+    const int margin = dialog_layout::scale_for_dpi(12, state.dpi);
+    const int gap = dialog_layout::scale_for_dpi(8, state.dpi);
+    const int font_height = dialog_font_height(
+        state.window, state.ui_font, state.dpi);
+    const int button_height = (std::max)(
+        dialog_layout::scale_for_dpi(30, state.dpi),
+        font_height + dialog_layout::scale_for_dpi(10, state.dpi));
+    const int status_height = (std::max)(
+        dialog_layout::scale_for_dpi(24, state.dpi), font_height);
+    const int copy_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"診断情報をコピー", 144);
+    const int log_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"ログを開く", 112);
+    const int folder_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"ログフォルダ", 112);
+    const int close_width = measured_button_width(
+        state.window, state.ui_font, state.dpi, L"閉じる", 100);
+    const int available_width = (std::max)(1, client_width - margin * 2);
+    const int single_row_width = copy_width + log_width + folder_width +
+        close_width + gap * 3;
+    const bool wrap_buttons = single_row_width > available_width;
+    const int button_rows_height = wrap_buttons
+        ? button_height * 2 + gap : button_height;
+    const int footer_height = button_rows_height + gap + status_height + margin * 2;
+    const int footer_top = (std::max)(margin,
+        client_height - footer_height);
+    move_to_rect(state.text, margin, margin, available_width,
+        (std::max)(1, footer_top - margin - gap));
+
+    if (!wrap_buttons) {
+        int x = margin;
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_COPY),
+            x, footer_top, copy_width, button_height);
+        x += copy_width + gap;
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_LOG),
+            x, footer_top, log_width, button_height);
+        x += log_width + gap;
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_LOG_FOLDER),
+            x, footer_top, folder_width, button_height);
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_CLOSE),
+            client_width - margin - close_width, footer_top,
+            close_width, button_height);
+    } else {
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_COPY),
+            margin, footer_top, copy_width, button_height);
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_LOG),
+            (std::min)(client_width - margin - log_width,
+                margin + copy_width + gap),
+            footer_top, log_width, button_height);
+        const int second_y = footer_top + button_height + gap;
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_LOG_FOLDER),
+            margin, second_y, folder_width, button_height);
+        move_to_rect(GetDlgItem(state.window, IDC_INFO_CLOSE),
+            client_width - margin - close_width, second_y,
+            close_width, button_height);
+    }
+    const int status_top = footer_top + button_rows_height + gap;
+    move_to_rect(state.status, margin, status_top,
+        available_width, status_height);
 }
 
 void set_information_status(InformationWindow& state, const wchar_t* value) {
@@ -1006,6 +1499,7 @@ LRESULT CALLBACK information_proc(
     }
     if (state == nullptr) return DefWindowProcW(window, message, wparam, lparam);
     if (message == WM_CREATE) {
+        state->dpi = valid_window_dpi(window);
         auto make = [&](const wchar_t* klass, const wchar_t* text, DWORD style, int id) {
             return CreateWindowExW(0, klass, text, WS_CHILD | WS_VISIBLE | style,
                 0, 0, 0, 0, window,
@@ -1020,6 +1514,31 @@ LRESULT CALLBACK information_proc(
         make(L"BUTTON", L"ログフォルダ", BS_PUSHBUTTON | WS_TABSTOP, IDC_INFO_LOG_FOLDER);
         make(L"BUTTON", L"閉じる", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_INFO_CLOSE);
         state->status = make(L"STATIC", L"", SS_LEFT, IDC_INFO_STATUS);
+        replace_dialog_font(window, state->ui_font, state->dpi);
+        position_information_controls(*state);
+        return 0;
+    }
+    if (message == WM_SIZE) {
+        position_information_controls(*state);
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO) {
+        apply_minmax_limits(window,
+            *reinterpret_cast<MINMAXINFO*>(lparam), SIZE{440, 300}, state->dpi);
+        return 0;
+    }
+    if (message == WM_DPICHANGED) {
+        const UINT new_dpi = LOWORD(wparam) == 0
+            ? dialog_layout::kDefaultDpi : LOWORD(wparam);
+        const RECT suggested = *reinterpret_cast<const RECT*>(lparam);
+        const RECT final_rect = dialog_layout::clamp_dpi_changed_rect(
+            suggested, new_dpi, kDialogWorkMargin);
+        state->dpi = new_dpi;
+        SetWindowPos(window, nullptr, final_rect.left, final_rect.top,
+            final_rect.right - final_rect.left,
+            final_rect.bottom - final_rect.top,
+            SWP_NOACTIVATE | SWP_NOZORDER);
+        replace_dialog_font(window, state->ui_font, state->dpi);
         position_information_controls(*state);
         return 0;
     }
@@ -1053,13 +1572,20 @@ LRESULT CALLBACK information_proc(
             }
             return 0;
         }
-        if (id == IDC_INFO_CLOSE) {
+        if (id == IDC_INFO_CLOSE || id == IDOK || id == IDCANCEL) {
             DestroyWindow(window);
             return 0;
         }
     }
     if (message == WM_CLOSE) { DestroyWindow(window); return 0; }
-    if (message == WM_DESTROY) { state->done = true; return 0; }
+    if (message == WM_DESTROY) {
+        if (state->ui_font != nullptr) {
+            DeleteObject(state->ui_font);
+            state->ui_font = nullptr;
+        }
+        state->done = true;
+        return 0;
+    }
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
@@ -1078,6 +1604,21 @@ void modal_loop(State& state) {
     ShowWindow(state.window, SW_SHOW); UpdateWindow(state.window);
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE &&
+            (message.hwnd == state.window ||
+             IsChild(state.window, message.hwnd))) {
+            SendMessageW(state.window, WM_CLOSE, 0, 0);
+            continue;
+        }
+        if (message.message == WM_KEYDOWN &&
+            (message.wParam == VK_PRIOR || message.wParam == VK_NEXT) &&
+            (GetWindowLongPtrW(state.window, GWL_STYLE) & WS_VSCROLL) != 0 &&
+            (message.hwnd == state.window ||
+             IsChild(state.window, message.hwnd))) {
+            SendMessageW(state.window, WM_VSCROLL,
+                message.wParam == VK_PRIOR ? SB_PAGEUP : SB_PAGEDOWN, 0);
+            continue;
+        }
         if (!IsDialogMessageW(state.window, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
     if (dialog_owner) { EnableWindow(dialog_owner, TRUE); SetForegroundWindow(dialog_owner); }
@@ -1092,11 +1633,23 @@ void show_environment_settings_dialog() {
     if (!register_class(class_name, environment_proc)) return;
     EnvironmentWindow state;
     std::wstring ignored; load_tool_settings(state.settings, ignored);
+    constexpr DWORD style = kResizableDialogStyle | WS_VSCROLL;
+    constexpr DWORD extended_style = WS_EX_DLGMODALFRAME;
+    auto placement = dialog_layout::calculate_initial_window_placement(
+        dialog_owner, SIZE{580, 365}, style, extended_style, kDialogWorkMargin);
+    const RECT rect = placement.final_rect;
     state.window = CreateWindowExW(WS_EX_DLGMODALFRAME, class_name, L"AviUtl2 LaTeX 環境設定",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
-        owner_scale(610), owner_scale(410),
+        style, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         dialog_owner, nullptr, GetModuleHandleW(nullptr), &state);
-    if (state.window) modal_loop(state);
+    if (state.window) {
+        placement = reconcile_created_window(
+            state.window, SIZE{580, 365}, style, extended_style);
+        RECT client{};
+        GetClientRect(state.window, &client);
+        dialog_layout::debug_log_window_placement(
+            L"environment_settings", placement, &client);
+        modal_loop(state);
+    }
 }
 
 void show_information_dialog(const InformationDialogSnapshot& snapshot) {
@@ -1106,11 +1659,22 @@ void show_information_dialog(const InformationDialogSnapshot& snapshot) {
     state.snapshot = snapshot;
     state.overview = build_information_overview(snapshot);
     state.report = build_diagnostic_report(snapshot);
+    constexpr DWORD style = kResizableDialogStyle;
+    constexpr DWORD extended_style = WS_EX_DLGMODALFRAME;
+    auto placement = dialog_layout::calculate_initial_window_placement(
+        dialog_owner, SIZE{720, 560}, style, extended_style, kDialogWorkMargin);
+    const RECT rect = placement.final_rect;
     state.window = CreateWindowExW(WS_EX_DLGMODALFRAME, class_name,
-        L"AviUtl2 LaTeX 情報", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, owner_scale(736), owner_scale(600),
+        L"AviUtl2 LaTeX 情報", style,
+        rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         dialog_owner, nullptr, GetModuleHandleW(nullptr), &state);
     if (state.window) {
+        placement = reconcile_created_window(
+            state.window, SIZE{720, 560}, style, extended_style);
+        RECT client{};
+        GetClientRect(state.window, &client);
+        dialog_layout::debug_log_window_placement(
+            L"information", placement, &client);
         append_latest_log("info_dialog_opened: yes\n");
         modal_loop(state);
     }
@@ -1127,11 +1691,23 @@ std::optional<SystemFontSelection> show_system_font_dialog(
     state.current = current_font;
     state.current_is_default = current_is_default;
     load_system_fonts(state);
+    constexpr DWORD style = kResizableDialogStyle;
+    constexpr DWORD extended_style = WS_EX_DLGMODALFRAME;
+    auto placement = dialog_layout::calculate_initial_window_placement(
+        dialog_owner, SIZE{456, 470}, style, extended_style, kDialogWorkMargin);
+    const RECT rect = placement.final_rect;
     state.window = CreateWindowExW(WS_EX_DLGMODALFRAME, class_name, L"フォント選択",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
-        owner_scale(480), owner_scale(510),
+        style, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
         dialog_owner, nullptr, GetModuleHandleW(nullptr), &state);
-    if (state.window) modal_loop(state);
+    if (state.window) {
+        placement = reconcile_created_window(
+            state.window, SIZE{456, 470}, style, extended_style);
+        RECT client{};
+        GetClientRect(state.window, &client);
+        dialog_layout::debug_log_window_placement(
+            L"font_selector", placement, &client);
+        modal_loop(state);
+    }
     return state.selected;
 }
 

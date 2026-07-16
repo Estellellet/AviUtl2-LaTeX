@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AviUtl2LaTeX VERSION 0.1.0 LANGUAGES CXX)
+project(AviUtl2LaTeX VERSION 0.1.1 LANGUAGES CXX)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md" AVIUTL2_LATEX_CHANGELOG)
 if(NOT AVIUTL2_LATEX_CHANGELOG MATCHES "## ${PROJECT_VERSION}([^0-9]|$)")
@@ -35,6 +35,7 @@ configure_file(
 add_library(AviUtl2LaTeX MODULE
     src/AppPaths.cpp
     src/AviUtl2LaTeX.cpp
+    src/DialogLayout.cpp
     src/EnvironmentDiagnostics.cpp
     src/ImageLoader.cpp
     src/LatexRenderer.cpp
@@ -126,6 +127,19 @@ if(BUILD_TESTING)
         /W4 /permissive- /utf-8 /Zc:__cplusplus /wd4828 /wd4201)
     target_link_libraries(PluginInfoSmoke PRIVATE shell32 ole32)
     add_test(NAME plugin_info_smoke COMMAND PluginInfoSmoke)
+
+    add_executable(DialogLayoutSmoke
+        tests/DialogLayoutSmoke.cpp
+        src/DialogLayout.cpp
+    )
+    target_compile_features(DialogLayoutSmoke PRIVATE cxx_std_20)
+    target_include_directories(DialogLayoutSmoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_options(DialogLayoutSmoke PRIVATE
+        /W4 /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+    target_link_libraries(DialogLayoutSmoke PRIVATE user32)
+    add_test(NAME dialog_layout_smoke COMMAND DialogLayoutSmoke)
 endif()
 
 set_target_properties(AviUtl2LaTeX PROPERTIES
