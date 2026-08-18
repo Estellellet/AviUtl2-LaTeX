@@ -19,9 +19,14 @@ std::wstring trim_copy(std::wstring_view value) {
     return std::wstring(value.substr(begin, end - begin));
 }
 
-std::wstring lowercase_copy(std::wstring value) {
+std::wstring lowercase_ascii_copy(std::wstring value) {
+    // Supported font extensions are ASCII. Keep this conversion independent
+    // from the process locale so it behaves identically on hosted CI runners.
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t value) {
-        return static_cast<wchar_t>(std::towlower(value));
+        if (value >= L'A' && value <= L'Z') {
+            return static_cast<wchar_t>(value + (L'a' - L'A'));
+        }
+        return value;
     });
     return value;
 }
@@ -347,7 +352,8 @@ DocumentJapaneseFontPreamble build_document_japanese_font_preamble(
         return result;
     }
 
-    const std::wstring extension = lowercase_copy(normalized.extension().wstring());
+    const std::wstring extension =
+        lowercase_ascii_copy(normalized.extension().wstring());
     if (extension != L".otf" && extension != L".ttf" && extension != L".ttc") {
         result.error_message =
             L"日本語フォントファイルの拡張子は.otf、.ttf、.ttcのみ対応しています";

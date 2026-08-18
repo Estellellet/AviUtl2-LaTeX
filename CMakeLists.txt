@@ -145,19 +145,36 @@ if(BUILD_TESTING)
     target_link_libraries(DialogLayoutSmoke PRIVATE user32)
     add_test(NAME dialog_layout_smoke COMMAND DialogLayoutSmoke)
 
-    add_executable(JapaneseFontConfigSmoke
+    function(add_japanese_font_config_smoke target source test_name)
+        add_executable(${target}
+            ${source}
+            src/JapaneseFontConfig.cpp
+        )
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        target_include_directories(${target} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        )
+        target_compile_options(${target} PRIVATE
+            /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+        add_test(
+            NAME ${test_name}
+            COMMAND ${target}
+                "${CMAKE_CURRENT_BINARY_DIR}/font-config-smoke-data")
+    endfunction()
+
+    add_japanese_font_config_smoke(
+        JapaneseFontConfigSmoke
         tests/JapaneseFontConfigSmoke.cpp
-        src/JapaneseFontConfig.cpp
-    )
-    target_compile_features(JapaneseFontConfigSmoke PRIVATE cxx_std_20)
-    target_include_directories(JapaneseFontConfigSmoke PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_options(JapaneseFontConfigSmoke PRIVATE
-        /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
-    add_test(NAME japanese_font_config_smoke COMMAND JapaneseFontConfigSmoke)
-    add_test(NAME font_config_migration_smoke COMMAND JapaneseFontConfigSmoke)
-    add_test(NAME cache_key_completeness_smoke COMMAND JapaneseFontConfigSmoke)
+        japanese_font_config_smoke)
+    add_japanese_font_config_smoke(
+        FontConfigMigrationSmoke
+        tests/FontConfigMigrationSmoke.cpp
+        font_config_migration_smoke)
+    add_japanese_font_config_smoke(
+        CacheKeyCompletenessSmoke
+        tests/CacheKeyCompletenessSmoke.cpp
+        cache_key_completeness_smoke)
 
     add_executable(StepParserSmoke
         tests/StepParserSmoke.cpp

@@ -68,7 +68,21 @@ jobs:
       - name: Build Release
         run: cmake --build build --config Release
       - name: Run CTest
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          $ctestExitCode = $LASTEXITCODE
+          if ($ctestExitCode -ne 0) {
+            $lastTestLog = Join-Path $PWD 'build/Testing/Temporary/LastTest.log'
+            if (Test-Path -LiteralPath $lastTestLog -PathType Leaf) {
+              Write-Host '===== CTest LastTest.log ====='
+              Get-Content -LiteralPath $lastTestLog
+              Write-Host '===== End CTest LastTest.log ====='
+            } else {
+              Write-Warning "CTest failed and LastTest.log was not found: $lastTestLog"
+            }
+            exit $ctestExitCode
+          }
       - name: Build catalog package
         run: cmake --build build --config Release --target package_catalog
       - name: Verify catalog package excludes SDK and development files
