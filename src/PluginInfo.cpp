@@ -4,12 +4,14 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
+#include <new>
 #include <sstream>
 #include <string_view>
+#include <system_error>
 
 #include "AppPaths.h"
 #include "GeneratedVersion.h"
@@ -17,6 +19,8 @@
 #include "ToolSettings.h"
 
 namespace {
+
+constexpr std::uintmax_t kMaximumLatestLogReadBytes = 4ULL * 1024ULL * 1024ULL;
 
 std::wstring utf8_to_wide(const std::string& value) {
     if (value.empty()) return {};
@@ -33,10 +37,34 @@ std::wstring read_latest_log() {
     AppPaths paths;
     std::wstring error;
     if (!resolve_app_paths(paths, error)) return {};
-    std::ifstream input(paths.latest_log, std::ios::binary);
-    if (!input) return {};
-    return utf8_to_wide(std::string(
-        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>()));
+    std::error_code code;
+    const std::uintmax_t file_size = std::filesystem::file_size(paths.latest_log, code);
+    if (code || file_size == 0) return {};
+
+    const std::uintmax_t read_size = (std::min)(file_size, kMaximumLatestLogReadBytes);
+    try {
+        std::ifstream input(paths.latest_log, std::ios::binary);
+        if (!input) return {};
+        const bool truncated = file_size > read_size;
+        if (truncated) {
+            input.seekg(-static_cast<std::streamoff>(read_size), std::ios::end);
+            if (!input) return {};
+        }
+        std::string bytes(static_cast<std::size_t>(read_size), '\0');
+        input.read(bytes.data(), static_cast<std::streamsize>(read_size));
+        const std::streamsize bytes_read = input.gcount();
+        if (bytes_read <= 0) return {};
+        bytes.resize(static_cast<std::size_t>(bytes_read));
+        if (truncated) {
+            const std::size_t first_newline = bytes.find('\n');
+            if (first_newline != std::string::npos) {
+                bytes.erase(0, first_newline + 1);
+            }
+        }
+        return utf8_to_wide(bytes);
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 std::wstring value_after_last(const std::wstring& text, std::wstring_view key) {
@@ -113,6 +141,7 @@ UserErrorCategory classify_user_error(
     const std::wstring& log_text) {
     if (contains_ci(log_text, L"timed_out: yes") || contains_ci(log_text, L"timeout: yes"))
         return UserErrorCategory::TimedOut;
+    if (failed_stage == L"compile_timeout") return UserErrorCategory::TimedOut;
     if (contains_ci(log_text, L"cancelled: yes")) return UserErrorCategory::Cancelled;
     if (failed_stage == L"settings_load") return UserErrorCategory::EnvironmentNotConfigured;
     if (failed_stage == L"lualatex_not_found") return UserErrorCategory::LuaLaTeXNotFound;
@@ -127,10 +156,15 @@ UserErrorCategory classify_user_error(
         return UserErrorCategory::LatexCompileFailed;
     }
     if (failed_stage == L"pdf_render") return UserErrorCategory::PdfRenderFailed;
-    if (failed_stage.find(L"image_limit") != std::wstring::npos ||
+    if (failed_stage == L"source_size_limit" ||
+        failed_stage == L"source_memory_allocation")
+        return UserErrorCategory::InvalidSetting;
+    if (failed_stage == L"render_memory_limit" ||
+        failed_stage.find(L"image_limit") != std::wstring::npos ||
         failed_stage.find(L"size_limit") != std::wstring::npos)
         return UserErrorCategory::ImageTooLarge;
     if (failed_stage == L"png_image_processing" ||
+        failed_stage == L"image_memory_allocation" ||
         failed_stage == L"empty_step_layer") return UserErrorCategory::ImageLoadFailed;
     if (failed_stage == L"japanese_font_configuration") {
         if (contains_ci(log_text, L"font_file_exists: no") ||
@@ -153,7 +187,10 @@ LastOperationInfo inspect_latest_compile_failure(const LastOperationInfo& base) 
         L"lualatex_not_found", L"mutool_not_found", L"lualatex_launch",
         L"mutool_launch", L"latex_compile", L"pdf_render",
         L"tikz_image_limit", L"png_file_size_limit", L"decoded_image_size_limit",
-        L"png_image_processing", L"japanese_font_configuration",
+        L"png_image_processing", L"image_memory_allocation",
+        L"source_size_limit", L"source_memory_allocation",
+        L"render_memory_limit", L"compile_timeout",
+        L"japanese_font_configuration",
         L"tikz_library_configuration", L"settings_load", L"step_count_limit",
         L"empty_step_layer", L"global_content_bounds", L"fixed_layout_composition"
     };

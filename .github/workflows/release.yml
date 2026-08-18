@@ -75,16 +75,33 @@ jobs:
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zipPath = Get-ChildItem -LiteralPath dist -Filter 'AviUtl2LaTeX-v*.zip' -File |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $zipPath) { throw 'Catalog ZIP was not generated.' }
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $match = [regex]::Match($cmake, 'project\(AviUtl2LaTeX VERSION ([0-9]+\.[0-9]+\.[0-9]+)')
+          if (-not $match.Success) { throw 'PROJECT_VERSION not found' }
+          $zipPath = Join-Path $PWD "dist/AviUtl2LaTeX-v$($match.Groups[1].Value).zip"
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "Catalog ZIP was not generated: $zipPath"
+          }
           $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
           try {
             $forbidden = @($archive.Entries | Where-Object {
-              $_.FullName -match '(^|/)(external|aviutl2_sdk|runtime|tools|logs|cache)(/|$)'
+              $_.FullName -match '(^|/)(external|aviutl2_sdk|runtime|tools|logs|cache|work|tests?)(/|$)' -or
+              $_.FullName -match '(^|/)(settings\.json|.*\.(pdb|ilk|lib|exp))$'
             })
             if ($forbidden.Count -ne 0) {
               throw "Forbidden development files found in catalog ZIP: $($forbidden.FullName -join ', ')"
+            }
+            $expected = @(
+              'AviUtl2LaTeX/',
+              'AviUtl2LaTeX/AviUtl2LaTeX.auf2',
+              'AviUtl2LaTeX/README.md',
+              'AviUtl2LaTeX/LICENSE',
+              'AviUtl2LaTeX/THIRD_PARTY_NOTICES.md',
+              'AviUtl2LaTeX/CHANGELOG.md'
+            ) | Sort-Object
+            $actual = @($archive.Entries.FullName) | Sort-Object
+            if ((Compare-Object $expected $actual).Count -ne 0) {
+              throw "Catalog ZIP entries differ from the release allowlist: $($actual -join ', ')"
             }
             Write-Host "Catalog ZIP validation: success ($zipPath)"
           } finally {

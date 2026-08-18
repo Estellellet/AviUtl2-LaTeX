@@ -24,9 +24,14 @@
 #include "filter2.h"
 #include "plugin2.h"
 #include "AppPaths.h"
+#include "DocumentTemplateBuilder.h"
+#include "ImageLoader.h"
+#include "JapaneseFontConfig.h"
 #include "LatexRenderer.h"
 #include "PersistentRenderCache.h"
 #include "PluginInfo.h"
+#include "SdkValueCopy.h"
+#include "StepParser.h"
 #include "ToolSettings.h"
 #include "UiDialogs.h"
 
@@ -36,7 +41,6 @@ void request_environment_settings(EDIT_SECTION* edit);
 void request_information(EDIT_SECTION* edit);
 void request_font_selection(EDIT_SECTION* edit);
 void request_font_file_selection(EDIT_SECTION* edit);
-int resolve_japanese_font_mode(const char* serialized_value, int fallback);
 
 namespace {
 
@@ -45,9 +49,15 @@ constexpr char kTemplateCacheVersion[] =
     "tikzpicture-template-monochrome-v1";
 constexpr char kAlignRelationSpacingCacheVersion[] =
     "align-relation-spacing-fix-v1";
+constexpr char kDocumentJapaneseMathFontCacheVersion[] =
+    "document-japanese-math-font-separation-v1";
 constexpr unsigned char kHiddenLayerAlphaThreshold = 2;
 constexpr unsigned char kContentAlphaThreshold = 1;
 constexpr double kStepEpsilon = 1.0e-9;
+constexpr ULONGLONG kMaximumCompileElapsedMs = 5ULL * 60ULL * 1000ULL;
+constexpr std::size_t kMaximumLatexSourceUtf8Bytes = 4U * 1024U * 1024U;
+constexpr std::uint64_t kMaximumCompileResidentPixelCount =
+    kMaximumDecodedPixelCount * 4ULL;
 
 enum class LatexTemplate : int {
     InlineMath = 0,
@@ -57,17 +67,22 @@ enum class LatexTemplate : int {
     TikzPicture = 4
 };
 
-enum class JapaneseFontMode : int {
-    Default = 0,
-    FontName = 1,
-    FontFile = 2
-};
+const char* template_cache_version(LatexTemplate selected_template) {
+    switch (selected_template) {
+    case LatexTemplate::AlignStar:
+        return kAlignRelationSpacingCacheVersion;
+    case LatexTemplate::Document:
+        return kDocumentJapaneseMathFontCacheVersion;
+    default:
+        return kTemplateCacheVersion;
+    }
+}
 
-enum class JapaneseSpacingMode : int {
-    Auto = 0,
-    Uniform = 1,
-    FontMetrics = 2
-};
+using aviutl2_latex::DocumentJapaneseFontPreamble;
+using aviutl2_latex::JapaneseFontConfig;
+using aviutl2_latex::JapaneseFontSource;
+using aviutl2_latex::JapaneseSpacingMode;
+using aviutl2_latex::LegacyJapaneseFontValues;
 
 enum class ParagraphAlignment : int {
     Left = 0,
@@ -100,37 +115,6 @@ struct LayerCropStats {
     std::uint64_t nonzero_alpha_pixels = 0;
     int cropped_destination_x = 0;
     int cropped_destination_y = 0;
-};
-
-struct JapaneseDocumentConfiguration {
-    bool enabled = false;
-    JapaneseFontMode font_mode = JapaneseFontMode::Default;
-    std::wstring font_name;
-    std::wstring font_file;
-    std::wstring normalized_font_directory;
-    std::wstring normalized_font_filename;
-    bool font_file_exists = false;
-    std::uintmax_t font_file_size = 0;
-    std::wstring font_file_last_write_time = L"not-applicable";
-    JapaneseSpacingMode spacing_requested = JapaneseSpacingMode::Auto;
-    JapaneseSpacingMode spacing_effective = JapaneseSpacingMode::Auto;
-    bool spacing_options_applied = false;
-    std::wstring spacing_jfm = L"not-specified";
-    std::wstring spacing_kerning = L"not-specified";
-    bool spacing_palt = false;
-    bool spacing_kern_feature = false;
-    std::wstring spacing_jfont_options;
-    std::wstring generated_script = L"not-specified";
-    std::wstring generated_raw_features = L"not-specified";
-    std::wstring generated_setmainfont;
-    std::wstring generated_setmainjfont;
-    std::wstring preamble;
-    std::wstring cache_material;
-    std::wstring error_message;
-
-    bool valid() const {
-        return error_message.empty();
-    }
 };
 
 struct DocumentLayoutConfiguration {
@@ -198,7 +182,6 @@ struct ObjectState {
     unsigned char colored_b = 0;
     std::shared_ptr<EffectOutputBuffer> effect_output =
         std::make_shared<EffectOutputBuffer>();
-    std::unordered_map<std::wstring, ImagePointer> source_cache;
     bool restore_attempted = false;
     std::wstring restored_cache_key;
     // FILTER_ITEM_DATA writes are formally supported from filter processing
@@ -257,14 +240,14 @@ bool store_persistent_key(
     return true;
 }
 
-bool is_valid_cached_image(const ImagePointer& image) {
-    if (!image || image->width <= 0 || image->height <= 0) {
+bool checked_pixel_count(int width, int height, std::uint64_t& pixel_count) {
+    if (width <= 0 || height <= 0) {
         return false;
     }
-    const std::size_t width = static_cast<std::size_t>(image->width);
-    const std::size_t height = static_cast<std::size_t>(image->height);
-    return width <= (std::numeric_limits<std::size_t>::max)() / height &&
-        image->pixels.size() >= width * height;
+    pixel_count = static_cast<std::uint64_t>(width) *
+        static_cast<std::uint64_t>(height);
+    return pixel_count <= kMaximumDecodedPixelCount &&
+        pixel_count <= (std::numeric_limits<std::size_t>::max)();
 }
 
 ImagePointer create_colored_image(
@@ -453,40 +436,6 @@ DocumentLayoutConfiguration resolve_document_layout(
         format_decimal_one_place(configuration.minipage_width_cm);
     configuration.paragraph_alignment = paragraph_alignment;
     return configuration;
-}
-
-std::vector<std::wstring> split_steps(const std::wstring& source) {
-    std::vector<std::wstring> steps;
-    std::vector<std::wstring> current_lines;
-
-    const auto flush_step = [&steps, &current_lines]() {
-        std::wstring step;
-        for (std::size_t index = 0; index < current_lines.size(); ++index) {
-            if (index != 0) {
-                step.push_back(L'\n');
-            }
-            step += current_lines[index];
-        }
-        if (!trim_copy(step).empty()) {
-            steps.push_back(std::move(step));
-        }
-        current_lines.clear();
-    };
-
-    std::wistringstream input(source);
-    std::wstring line;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == L'\r') {
-            line.pop_back();
-        }
-        if (trim_copy(line) == L"%<step>") {
-            flush_step();
-        } else {
-            current_lines.push_back(std::move(line));
-        }
-    }
-    flush_step();
-    return steps;
 }
 
 std::string narrow_hash(const std::wstring& hash) {
@@ -780,25 +729,14 @@ const wchar_t* paragraph_alignment_command(ParagraphAlignment alignment) {
     }
 }
 
-JapaneseFontMode resolve_japanese_font_mode(int value) {
+JapaneseFontSource japanese_font_source_from_selection(int value) {
     switch (value) {
     case 1:
-        return JapaneseFontMode::FontName;
+        return JapaneseFontSource::InstalledFamily;
     case 2:
-        return JapaneseFontMode::FontFile;
+        return JapaneseFontSource::FontFile;
     default:
-        return JapaneseFontMode::Default;
-    }
-}
-
-const wchar_t* japanese_font_mode_name(JapaneseFontMode mode) {
-    switch (mode) {
-    case JapaneseFontMode::FontName:
-        return L"font-name";
-    case JapaneseFontMode::FontFile:
-        return L"font-file";
-    default:
-        return L"default";
+        return JapaneseFontSource::Default;
     }
 }
 
@@ -813,250 +751,18 @@ JapaneseSpacingMode japanese_spacing_mode_from_selection(int value) {
     }
 }
 
-JapaneseSpacingMode japanese_spacing_mode_from_serialized_value(
-    const std::string& value) {
-    if (value == to_utf8_for_log(L"自動") || value == "0") {
-        return JapaneseSpacingMode::Auto;
-    }
-    if (value == to_utf8_for_log(L"均等") || value == "1") {
-        return JapaneseSpacingMode::Uniform;
-    }
-    if (value == to_utf8_for_log(L"フォント準拠") || value == "2") {
-        return JapaneseSpacingMode::FontMetrics;
-    }
-    return JapaneseSpacingMode::Auto;
-}
-
 bool is_legacy_custom_spacing_value(const std::string& value) {
     return value == to_utf8_for_log(L"カスタム") || value == "3" ||
         value == "custom" || value == "Custom";
 }
 
-const wchar_t* japanese_spacing_mode_name(JapaneseSpacingMode mode) {
-    switch (mode) {
-    case JapaneseSpacingMode::Uniform:
-        return L"uniform";
-    case JapaneseSpacingMode::FontMetrics:
-        return L"font-metrics";
-    default:
-        return L"auto";
-    }
-}
-
-void configure_japanese_spacing(
-    JapaneseDocumentConfiguration& configuration,
-    JapaneseSpacingMode requested_mode) {
-    configuration.spacing_requested = requested_mode;
-    if (configuration.font_mode == JapaneseFontMode::Default) {
-        return;
-    }
-
-    configuration.spacing_effective =
-        requested_mode == JapaneseSpacingMode::Auto
-        ? JapaneseSpacingMode::FontMetrics
-        : requested_mode;
-    configuration.spacing_options_applied = true;
-    if (configuration.spacing_effective == JapaneseSpacingMode::Uniform) {
-        configuration.spacing_jfm = L"ujis";
-        configuration.spacing_kerning = L"off";
-        configuration.spacing_jfont_options =
-            L"  YokoFeatures={JFM=ujis},\n"
-            L"  Kerning=Off\n";
-        return;
-    }
-
-    configuration.spacing_jfm = L"propw";
-    configuration.spacing_kerning = L"on";
-    configuration.spacing_palt = true;
-    configuration.spacing_kern_feature = true;
-    configuration.generated_script = L"Default";
-    configuration.generated_raw_features = L"+palt,+kern";
-    configuration.spacing_jfont_options =
-        L"  YokoFeatures={JFM=propw},\n"
-        L"  Kerning=On,\n"
-        L"  Script=Default,\n"
-        L"  RawFeature={+palt,+kern}\n";
-}
-
 const wchar_t* japanese_spacing_effective_name(
-    const JapaneseDocumentConfiguration& configuration) {
+    const DocumentJapaneseFontPreamble& configuration) {
     if (!configuration.spacing_options_applied) {
         return L"default";
     }
-    return japanese_spacing_mode_name(configuration.spacing_effective);
-}
-
-bool contains_unsafe_font_name_character(const std::wstring& value) {
-    return value.find_first_of(L"\r\n{}%#\\&$^~_") != std::wstring::npos;
-}
-
-bool contains_unsafe_font_path_character(const std::wstring& value) {
-    return value.find_first_of(L"\r\n{}%#&$^~") != std::wstring::npos;
-}
-
-std::wstring lowercase_copy(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
-    return value;
-}
-
-JapaneseDocumentConfiguration build_japanese_document_configuration(
-    LatexTemplate selected_template,
-    bool japanese_requested,
-    int font_mode_value,
-    JapaneseSpacingMode spacing_mode,
-    const std::wstring& requested_font_name,
-    const std::wstring& requested_font_file) {
-    JapaneseDocumentConfiguration configuration;
-    if (selected_template != LatexTemplate::Document) {
-        return configuration;
-    }
-
-    configuration.enabled = japanese_requested;
-    configuration.font_mode = resolve_japanese_font_mode(font_mode_value);
-    configuration.spacing_requested = spacing_mode;
-    configuration.font_name = trim_copy(requested_font_name);
-    configuration.font_file = trim_copy(requested_font_file);
-    configuration.cache_material =
-        L"japanese_enabled=" + std::to_wstring(configuration.enabled ? 1 : 0);
-    if (!configuration.enabled) {
-        return configuration;
-    }
-    configure_japanese_spacing(configuration, spacing_mode);
-    configuration.cache_material +=
-        L"\nfont_mode=" + std::wstring(japanese_font_mode_name(configuration.font_mode)) +
-        L"\njapanese-spacing-requested=" +
-            japanese_spacing_mode_name(configuration.spacing_requested) +
-        L"\njapanese-spacing-effective=" +
-            japanese_spacing_effective_name(configuration) +
-        L"\njapanese-jfm=" +
-            (configuration.spacing_options_applied
-                ? configuration.spacing_jfm
-                : L"default") +
-        L"\njapanese-kerning=" +
-            (configuration.spacing_options_applied
-                ? configuration.spacing_kerning
-                : L"default") +
-        L"\njapanese-palt=" +
-            std::wstring(configuration.spacing_palt ? L"on" : L"off") +
-        L"\njapanese-kern-feature=" +
-            std::wstring(configuration.spacing_kern_feature ? L"on" : L"off");
-    configuration.preamble =
-        L"\\usepackage{fontspec}\n"
-        L"\\usepackage{luatexja}\n"
-        L"\\usepackage{luatexja-fontspec}\n";
-    if (configuration.font_mode == JapaneseFontMode::Default) {
-        return configuration;
-    }
-
-    if (configuration.font_mode == JapaneseFontMode::FontName) {
-        if (configuration.font_name.empty()) {
-            configuration.error_message = L"日本語フォント名が空です";
-            return configuration;
-        }
-        if (contains_unsafe_font_name_character(requested_font_name)) {
-            configuration.error_message =
-                L"日本語フォント名にTeXへ安全に渡せない文字が含まれています";
-            return configuration;
-        }
-        configuration.generated_setmainfont =
-            L"\\setmainfont{" + configuration.font_name + L"}\n";
-        configuration.preamble += configuration.generated_setmainfont;
-        if (configuration.spacing_options_applied) {
-            configuration.generated_setmainjfont =
-                L"\\setmainjfont[\n" + configuration.spacing_jfont_options +
-                L"]{" + configuration.font_name + L"}\n";
-        } else {
-            configuration.generated_setmainjfont =
-                L"\\setmainjfont{" + configuration.font_name + L"}\n";
-        }
-        configuration.preamble += configuration.generated_setmainjfont;
-        configuration.cache_material += L"\nfont_name=" + configuration.font_name;
-        return configuration;
-    }
-
-    if (configuration.font_file.empty()) {
-        configuration.error_message = L"日本語フォントファイルが空です";
-        return configuration;
-    }
-    if (contains_unsafe_font_path_character(requested_font_file)) {
-        configuration.error_message =
-            L"日本語フォントファイルのパスにTeXへ安全に渡せない文字が含まれています";
-        return configuration;
-    }
-
-    std::error_code error;
-    std::filesystem::path font_path(configuration.font_file);
-    font_path = std::filesystem::absolute(font_path, error).lexically_normal();
-    if (error) {
-        configuration.error_message = L"日本語フォントファイルの絶対パスを取得できません";
-        return configuration;
-    }
-    configuration.font_file = font_path.wstring();
-    configuration.font_file_exists =
-        std::filesystem::exists(font_path, error) && !error;
-    if (!configuration.font_file_exists ||
-        !std::filesystem::is_regular_file(font_path, error) || error) {
-        configuration.error_message =
-            L"日本語フォントファイルが存在しないか、通常ファイルではありません";
-        return configuration;
-    }
-
-    const std::wstring extension = lowercase_copy(font_path.extension().wstring());
-    if (extension != L".otf" && extension != L".ttf" && extension != L".ttc") {
-        configuration.error_message =
-            L"日本語フォントファイルの拡張子は.otf、.ttf、.ttcのみ対応しています";
-        return configuration;
-    }
-
-    configuration.font_file_size = std::filesystem::file_size(font_path, error);
-    if (error) {
-        configuration.error_message = L"日本語フォントファイルのサイズを取得できません";
-        return configuration;
-    }
-    const auto last_write_time = std::filesystem::last_write_time(font_path, error);
-    configuration.font_file_last_write_time = error
-        ? L"unavailable"
-        : std::to_wstring(last_write_time.time_since_epoch().count());
-
-    configuration.normalized_font_directory =
-        font_path.parent_path().generic_wstring();
-    if (!configuration.normalized_font_directory.empty() &&
-        configuration.normalized_font_directory.back() != L'/') {
-        configuration.normalized_font_directory.push_back(L'/');
-    }
-    configuration.normalized_font_filename = font_path.filename().generic_wstring();
-    if (contains_unsafe_font_path_character(configuration.normalized_font_directory) ||
-        contains_unsafe_font_path_character(configuration.normalized_font_filename)) {
-        configuration.error_message =
-            L"日本語フォントファイルのパスにTeXへ安全に渡せない文字が含まれています";
-        return configuration;
-    }
-
-    configuration.generated_setmainfont =
-        L"\\setmainfont[\n  Path={" + configuration.normalized_font_directory +
-        L"}\n]{" + configuration.normalized_font_filename + L"}\n";
-    configuration.preamble += configuration.generated_setmainfont;
-    if (configuration.spacing_options_applied) {
-        configuration.generated_setmainjfont =
-            L"\\setmainjfont[\n  Path={" +
-            configuration.normalized_font_directory + L"},\n" +
-            configuration.spacing_jfont_options + L"]{" +
-            configuration.normalized_font_filename + L"}\n";
-    } else {
-        configuration.generated_setmainjfont =
-            L"\\setmainjfont[\n  Path={" +
-            configuration.normalized_font_directory + L"}\n]{" +
-            configuration.normalized_font_filename + L"}\n";
-    }
-    configuration.preamble += configuration.generated_setmainjfont;
-    configuration.cache_material +=
-        L"\nnormalized_font_file=" + configuration.normalized_font_directory +
-            configuration.normalized_font_filename +
-        L"\nfont_file_size=" + std::to_wstring(configuration.font_file_size) +
-        L"\nfont_file_last_write_time=" + configuration.font_file_last_write_time;
-    return configuration;
+    return aviutl2_latex::japanese_spacing_mode_name(
+        configuration.spacing_effective);
 }
 
 bool parse_environment_command(
@@ -1331,15 +1037,21 @@ bool create_globally_cropped_layers(
     std::vector<LayerCropStats>& layer_stats) {
     original_canvas_width = 1;
     original_canvas_height = 1;
+    std::uint64_t raw_pixel_count = 0;
     for (const auto& image : source_images) {
         if (!image || image->width <= 0 || image->height <= 0) {
             return false;
         }
-        const auto source_pixel_count =
-            static_cast<std::size_t>(image->width) * static_cast<std::size_t>(image->height);
-        if (image->pixels.size() < source_pixel_count) {
+        std::uint64_t source_pixel_count = 0;
+        if (!checked_pixel_count(
+                image->width, image->height, source_pixel_count) ||
+            image->pixels.size() < source_pixel_count ||
+            raw_pixel_count > kMaximumCompileResidentPixelCount -
+                source_pixel_count) {
+            append_latest_log("failed_stage: render_memory_limit\n");
             return false;
         }
+        raw_pixel_count += source_pixel_count;
         original_canvas_width = (std::max)(original_canvas_width, image->width);
         original_canvas_height = (std::max)(original_canvas_height, image->height);
     }
@@ -1408,9 +1120,26 @@ bool create_globally_cropped_layers(
     }
     final_canvas_width = static_cast<int>(calculated_width);
     final_canvas_height = static_cast<int>(calculated_height);
+    std::uint64_t canvas_pixel_count64 = 0;
+    if (!checked_pixel_count(
+            final_canvas_width, final_canvas_height, canvas_pixel_count64)) {
+        append_latest_log("failed_stage: render_memory_limit\n");
+        return false;
+    }
+    const std::uint64_t canvas_copy_count =
+        static_cast<std::uint64_t>(source_images.size()) * 2ULL + 2ULL;
+    if (canvas_copy_count == 0 ||
+        canvas_pixel_count64 >
+            (kMaximumCompileResidentPixelCount - raw_pixel_count) /
+                canvas_copy_count) {
+        append_latest_log(
+            "failed_stage: render_memory_limit\n"
+            "configured_resident_pixel_limit: " +
+                std::to_string(kMaximumCompileResidentPixelCount) + "\n");
+        return false;
+    }
     const auto canvas_pixel_count =
-        static_cast<std::size_t>(final_canvas_width) *
-        static_cast<std::size_t>(final_canvas_height);
+        static_cast<std::size_t>(canvas_pixel_count64);
     try {
         padded_images = std::make_shared<ImageList>();
         padded_images->reserve(source_images.size());
@@ -1475,7 +1204,13 @@ bool create_cumulative_images(
         }
         const int width = step_layers.front()->width;
         const int height = step_layers.front()->height;
-        const auto pixel_count = static_cast<std::size_t>(width) * height;
+        std::uint64_t pixel_count64 = 0;
+        if (!checked_pixel_count(width, height, pixel_count64) ||
+            pixel_count64 > kMaximumCompileResidentPixelCount /
+                (static_cast<std::uint64_t>(step_layers.size()) + 1ULL)) {
+            return false;
+        }
+        const auto pixel_count = static_cast<std::size_t>(pixel_count64);
         std::vector<PIXEL_RGBA> accumulated(
             pixel_count, PIXEL_RGBA{ 255, 255, 255, 0 });
         for (const auto& layer : step_layers) {
@@ -1561,9 +1296,21 @@ public:
         LatexTemplate selected_template,
         const std::vector<std::wstring>& steps,
         std::size_t target_step,
-        const JapaneseDocumentConfiguration& japanese_configuration,
+        const DocumentJapaneseFontPreamble& japanese_configuration,
         const DocumentLayoutConfiguration& layout_configuration,
         const TikzConfiguration& tikz_configuration) {
+        if (selected_template == LatexTemplate::Document) {
+            aviutl2_latex::DocumentTemplateOptions options;
+            options.additional_preamble = japanese_configuration.preamble;
+            options.minipage_enabled = layout_configuration.minipage_enabled();
+            options.formatted_minipage_width_cm =
+                layout_configuration.formatted_minipage_width_cm;
+            options.paragraph_alignment_command = paragraph_alignment_command(
+                layout_configuration.paragraph_alignment);
+            return aviutl2_latex::build_document_step_layer_source(
+                steps, target_step, options);
+        }
+
         std::wstring body;
         for (std::size_t index = 0; index < steps.size(); ++index) {
             if (!body.empty() && selected_template != LatexTemplate::InlineMath) {
@@ -1584,12 +1331,6 @@ public:
                 body += L"}";
             } else if (selected_template == LatexTemplate::AlignStar) {
                 body += apply_alignment_cell_color(steps[index], visible);
-            } else if (selected_template == LatexTemplate::Document) {
-                body += L"\\begingroup\\color{";
-                body += visible ? L"black" : L"white";
-                body += L"}\n";
-                body += steps[index];
-                body += L"\n\\endgroup";
             } else {
                 body += apply_math_structure_color(steps[index], visible, false);
             }
@@ -1597,9 +1338,7 @@ public:
         return build_document(
             selected_template,
             body,
-            selected_template == LatexTemplate::Document
-                ? japanese_configuration.preamble
-                : std::wstring{},
+            std::wstring{},
             layout_configuration,
             tikz_configuration);
     }
@@ -1736,9 +1475,9 @@ auto japanese_settings_group =
 auto japanese_enabled = FILTER_ITEM_CHECK(L"日本語対応", false);
 auto japanese_font_in_use = FILTER_ITEM_STRING(L"使用中", L"既定");
 auto japanese_font_select_button =
-    FILTER_ITEM_BUTTON(L"フォント選択", request_font_selection);
+    FILTER_ITEM_BUTTON(L"一覧から選択", request_font_selection);
 auto japanese_font_file_button =
-    FILTER_ITEM_BUTTON(L"ファイル読込", request_font_file_selection);
+    FILTER_ITEM_BUTTON(L"ファイルから選択", request_font_file_selection);
 FILTER_ITEM_SELECT::ITEM japanese_spacing_items[] = {
     { L"自動", 0 },
     { L"均等", 1 },
@@ -1884,6 +1623,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     host_edit_handle = nullptr;
     set_dialog_owner(nullptr);
+    last_object_id.store(-1, std::memory_order_relaxed);
+    std::lock_guard state_lock(state_mutex);
+    object_states.clear();
 }
 
 std::wstring from_utf8_for_object_value(const char* value) {
@@ -1920,27 +1662,22 @@ std::optional<std::string> get_object_value_copy(
 
     // The SDK guarantees a returned LPCSTR only until the next string-returning
     // SDK call on the same thread. Copy every value before requesting another.
-    const char* current_pointer = edit->get_object_item_value(
-        object, L"LaTeX", current_name);
-    std::optional<std::string> current;
-    if (current_pointer != nullptr) {
-        current.emplace(current_pointer);
+    const std::optional<std::string> current = sdk_value::copy_string(
+        edit->get_object_item_value(object, L"LaTeX", current_name));
+    if (current) {
         if (!current->empty() || legacy_name == nullptr) {
             return current;
         }
     }
 
     if (legacy_name != nullptr) {
-        const char* legacy_pointer = edit->get_object_item_value(
-            object, L"LaTeX", legacy_name);
-        if (legacy_pointer != nullptr) {
-            std::string legacy(legacy_pointer);
-            if (!legacy.empty()) {
-                if (legacy_used != nullptr) {
-                    *legacy_used = true;
-                }
-                return legacy;
+        const std::optional<std::string> legacy = sdk_value::copy_string(
+            edit->get_object_item_value(object, L"LaTeX", legacy_name));
+        if (legacy && !legacy->empty()) {
+            if (legacy_used != nullptr) {
+                *legacy_used = true;
             }
+            return legacy;
         }
     }
     return current;
@@ -1952,14 +1689,6 @@ std::string object_handle_for_log(OBJECT_HANDLE object) {
         reinterpret_cast<std::uintptr_t>(object);
     return stream.str();
 }
-
-struct OwnedFontSettings {
-    int mode = 0;
-    std::string family_name;
-    std::string file_path;
-    std::string display_name = to_utf8_for_log(L"既定");
-    bool needs_migration = false;
-};
 
 template<std::size_t Size>
 std::optional<std::string> fixed_field_value(
@@ -1977,7 +1706,7 @@ bool set_fixed_field(std::array<char, Size>& field, const std::string& value) {
     return true;
 }
 
-std::optional<OwnedFontSettings> font_settings_from_data(
+std::optional<JapaneseFontConfig> font_settings_from_data(
     const FontObjectData* data) {
     if (data == nullptr ||
         data->schema_version != FontObjectData::kSchemaVersion ||
@@ -1988,24 +1717,39 @@ std::optional<OwnedFontSettings> font_settings_from_data(
     const auto file = fixed_field_value(data->font_file_path);
     const auto display = fixed_field_value(data->display_name);
     if (!family || !file || !display) return std::nullopt;
-    OwnedFontSettings result;
-    result.mode = data->mode;
-    result.family_name = *family;
-    result.file_path = *file;
-    result.display_name = display->empty()
-        ? to_utf8_for_log(L"既定") : *display;
-    return result;
+
+    JapaneseFontConfig result;
+    result.source = japanese_font_source_from_selection(data->mode);
+    result.fontspec_family_name = from_utf8_for_object_value(family->c_str());
+    result.file_path = std::filesystem::path(
+        from_utf8_for_object_value(file->c_str()));
+    result.display_name = from_utf8_for_object_value(display->c_str());
+    if (result.display_name.empty()) {
+        result.display_name = aviutl2_latex::japanese_font_display_value(result);
+    }
+    return aviutl2_latex::is_saved_japanese_font_config_valid(result)
+        ? std::optional<JapaneseFontConfig>(std::move(result))
+        : std::nullopt;
 }
 
 std::optional<FontObjectData> make_font_object_data(
-    const OwnedFontSettings& settings) {
-    if (settings.mode < 0 || settings.mode > 2) return std::nullopt;
+    const JapaneseFontConfig& settings) {
+    if (!aviutl2_latex::is_saved_japanese_font_config_valid(settings)) {
+        return std::nullopt;
+    }
     FontObjectData data;
     data.schema_version = FontObjectData::kSchemaVersion;
-    data.mode = static_cast<unsigned char>(settings.mode);
-    if (!set_fixed_field(data.fontspec_family_name, settings.family_name) ||
-        !set_fixed_field(data.font_file_path, settings.file_path) ||
-        !set_fixed_field(data.display_name, settings.display_name)) {
+    data.mode = static_cast<unsigned char>(settings.source);
+    if (!set_fixed_field(
+            data.fontspec_family_name,
+            to_utf8_for_log(settings.fontspec_family_name)) ||
+        !set_fixed_field(
+            data.font_file_path,
+            to_utf8_for_log(settings.file_path.wstring())) ||
+        !set_fixed_field(
+            data.display_name,
+            to_utf8_for_log(aviutl2_latex::japanese_font_display_value(
+                settings)))) {
         return std::nullopt;
     }
     return data;
@@ -2013,7 +1757,7 @@ std::optional<FontObjectData> make_font_object_data(
 
 bool queue_font_object_data(
     std::int64_t object_id,
-    const OwnedFontSettings& settings) {
+    const JapaneseFontConfig& settings) {
     const auto data = make_font_object_data(settings);
     if (object_id < 0 || !data) return false;
     std::lock_guard state_lock(state_mutex);
@@ -2021,50 +1765,48 @@ bool queue_font_object_data(
     return true;
 }
 
-OwnedFontSettings read_owned_font_settings(
+JapaneseFontConfig read_japanese_font_config(
     EDIT_SECTION* edit,
     OBJECT_HANDLE object,
     std::int64_t object_id) {
+    std::optional<JapaneseFontConfig> current;
     if (object_id >= 0) {
         std::lock_guard state_lock(state_mutex);
         const auto state = object_states.find(object_id);
         if (state != object_states.end() && state->second.pending_font_data) {
-            if (const auto pending = font_settings_from_data(
-                    &*state->second.pending_font_data)) {
-                return *pending;
-            }
+            current = font_settings_from_data(&*state->second.pending_font_data);
         }
     }
-    // FILTER_ITEM_BUTTON refreshes DATA::value for the focused object. Copy it
-    // immediately and never retain the SDK-owned pointer past this callback.
-    if (const auto hidden = font_settings_from_data(font_object_data.value)) {
-        return *hidden;
+    if (!current) {
+        // FILTER_ITEM_BUTTON refreshes DATA::value for the focused object.
+        // Copy it immediately and never retain the SDK-owned pointer.
+        current = font_settings_from_data(font_object_data.value);
+    }
+    if (current) {
+        return aviutl2_latex::resolve_japanese_font_config(current, {});
     }
 
-    OwnedFontSettings legacy;
-    legacy.needs_migration = true;
-    const auto mode = get_object_value_copy(edit, object, L"フォント指定");
-    legacy.mode = resolve_japanese_font_mode(
-        mode ? mode->c_str() : nullptr, 0);
+    LegacyJapaneseFontValues legacy;
+    if (const auto mode = get_object_value_copy(
+            edit, object, L"フォント指定")) {
+        legacy.source_value = from_utf8_for_object_value(mode->c_str());
+    }
     if (const auto family = get_object_value_copy(
             edit, object, L"フォント名", L"日本語フォント名")) {
-        legacy.family_name = *family;
+        legacy.fontspec_family_name =
+            from_utf8_for_object_value(family->c_str());
     }
     if (const auto file = get_object_value_copy(
             edit, object, L"フォントファイル", L"日本語フォントファイル")) {
-        legacy.file_path = *file;
+        legacy.file_path = std::filesystem::path(
+            from_utf8_for_object_value(file->c_str()));
     }
-    if (const auto display = get_object_value_copy(edit, object, L"使用中");
-        display && !display->empty()) {
-        legacy.display_name = *display;
-    } else if (legacy.mode == 1 && !legacy.family_name.empty()) {
-        legacy.display_name = legacy.family_name;
-    } else if (legacy.mode == 2 && !legacy.file_path.empty()) {
-        legacy.display_name = to_utf8_for_log(
-            std::filesystem::path(from_utf8_for_object_value(
-                legacy.file_path.c_str())).filename().wstring());
+    if (const auto display = get_object_value_copy(
+            edit, object, L"使用中")) {
+        legacy.display_name = from_utf8_for_object_value(display->c_str());
     }
-    return legacy;
+    return aviutl2_latex::resolve_japanese_font_config(
+        std::nullopt, legacy);
 }
 
 void request_environment_settings(EDIT_SECTION*) {
@@ -2097,43 +1839,50 @@ void request_font_selection(EDIT_SECTION* edit) {
         return;
     }
     const std::int64_t object_id = find_target_object_id(edit, object);
-    const OwnedFontSettings previous =
-        read_owned_font_settings(edit, object, object_id);
+    const JapaneseFontConfig previous =
+        read_japanese_font_config(edit, object, object_id);
     if (host_edit_handle != nullptr) {
         set_dialog_owner(host_edit_handle->get_host_app_window());
     }
     const auto selected = show_system_font_dialog(
-        from_utf8_for_object_value(previous.family_name.c_str()),
-        previous.mode == 0);
+        previous.fontspec_family_name,
+        previous.source == JapaneseFontSource::Default);
     if (!selected) {
         return;
     }
 
-    OwnedFontSettings next = previous;
+    JapaneseFontConfig next = previous;
     if (selected->use_default) {
-        next.mode = 0;
-        next.display_name = to_utf8_for_log(L"既定");
+        next.source = JapaneseFontSource::Default;
+        next.display_name = L"既定";
     } else {
-        next.mode = 1;
-        next.family_name = to_utf8_for_log(selected->fontspec_family_name);
-        next.display_name = to_utf8_for_log(
+        next.source = JapaneseFontSource::InstalledFamily;
+        next.fontspec_family_name = selected->fontspec_family_name;
+        next.display_name =
             selected->display_name.empty()
                 ? selected->fontspec_family_name
-                : selected->display_name);
+                : selected->display_name;
     }
+    next.needs_migration = false;
+    const std::string serialized_display = to_utf8_for_log(
+        aviutl2_latex::japanese_font_display_value(next));
     const bool data_queued = queue_font_object_data(object_id, next);
     const bool display_set = data_queued && edit->set_object_item_value(
-        object, L"LaTeX", L"使用中", next.display_name.c_str());
+        object, L"LaTeX", L"使用中", serialized_display.c_str());
     if (!display_set && data_queued) {
         queue_font_object_data(object_id, previous);
     }
     append_latest_log(
         "operation: font_selection\n"
-        "font_selection_display_name: " + next.display_name + "\n" +
+        "font_selection_display_name: " + serialized_display + "\n" +
         "font_selection_fontspec_name: " +
-            (next.mode == 1 ? next.family_name : "default") + "\n" +
+            (next.source == JapaneseFontSource::InstalledFamily
+                ? to_utf8_for_log(next.fontspec_family_name)
+                : "default") + "\n" +
         "font_selection_internal_mode: " +
-            std::string(next.mode == 0 ? "Default\n" : "FontName\n") +
+            std::string(next.source == JapaneseFontSource::Default
+                ? "Default\n"
+                : "InstalledFamily\n") +
         "font_selection_target_object: " + object_handle_for_log(object) + "\n" +
         "font_hidden_data_queued: " +
             std::string(data_queued ? "yes\n" : "no\n") +
@@ -2149,24 +1898,23 @@ void request_font_file_selection(EDIT_SECTION* edit) {
         return;
     }
     const std::int64_t object_id = find_target_object_id(edit, object);
-    const OwnedFontSettings previous =
-        read_owned_font_settings(edit, object, object_id);
+    const JapaneseFontConfig previous =
+        read_japanese_font_config(edit, object, object_id);
     if (host_edit_handle != nullptr) {
         set_dialog_owner(host_edit_handle->get_host_app_window());
     }
     const auto selected = show_font_file_dialog(
-        std::filesystem::path(from_utf8_for_object_value(
-            previous.file_path.c_str())));
+        previous.file_path);
     if (!selected) {
         return;
     }
-    const std::string serialized_file = to_utf8_for_log(selected->wstring());
     const std::string display_file =
         to_utf8_for_log(selected->filename().wstring());
-    OwnedFontSettings next = previous;
-    next.mode = 2;
-    next.file_path = serialized_file;
-    next.display_name = display_file;
+    JapaneseFontConfig next = previous;
+    next.source = JapaneseFontSource::FontFile;
+    next.file_path = *selected;
+    next.display_name = selected->filename().wstring();
+    next.needs_migration = false;
     const bool data_queued = queue_font_object_data(object_id, next);
     const bool display_updated = data_queued && edit->set_object_item_value(
         object, L"LaTeX", L"使用中", display_file.c_str());
@@ -2249,23 +1997,6 @@ bool resolve_object_check(const char* serialized_value, bool fallback) {
     return fallback;
 }
 
-int resolve_japanese_font_mode(const char* serialized_value, int fallback) {
-    if (serialized_value == nullptr) {
-        return fallback;
-    }
-    const std::string value(serialized_value);
-    if (value == "0" || value == to_utf8_for_log(L"既定")) {
-        return 0;
-    }
-    if (value == "1" || value == to_utf8_for_log(L"フォント名")) {
-        return 1;
-    }
-    if (value == "2" || value == to_utf8_for_log(L"フォントファイル")) {
-        return 2;
-    }
-    return fallback;
-}
-
 void commit_pending_font_data(std::int64_t object_id) {
     std::optional<FontObjectData> pending;
     {
@@ -2321,8 +2052,8 @@ void migrate_legacy_font_data_if_needed(
         position.end != video->object->frame_e) {
         return;
     }
-    const OwnedFontSettings legacy =
-        read_owned_font_settings(video->edit, object, object_id);
+    const JapaneseFontConfig legacy =
+        read_japanese_font_config(video->edit, object, object_id);
     const auto migrated = make_font_object_data(legacy);
     if (!migrated || font_object_data.value == nullptr) return;
     *font_object_data.value = *migrated;
@@ -2462,6 +2193,19 @@ void restore_object_images_from_saved_cache(std::int64_t object_id) {
 }
 
 void request_compile(EDIT_SECTION* edit) {
+    const ULONGLONG compile_started_at = GetTickCount64();
+    // FILTER_ITEM_BUTTON refreshes every item for the focused object before
+    // invoking this callback. FILTER_ITEM_TEXT::value is therefore the raw
+    // multiline text. get_object_item_value() must not be used for this item:
+    // it returns alias-file syntax, where newlines and TeX backslashes are
+    // escaped. Own the raw value before making any further SDK calls.
+    bool source_size_exceeded = false;
+    bool source_copy_allocation_failed = false;
+    auto focused_source_value = sdk_value::copy_refreshed_text_item(
+        latex_source.value,
+        kMaximumLatexSourceUtf8Bytes,
+        &source_size_exceeded,
+        &source_copy_allocation_failed);
     OBJECT_HANDLE object = edit != nullptr ? edit->get_focus_object() : nullptr;
     const std::int64_t object_id = find_target_object_id(edit, object);
     // The button callback contract refreshes every FILTER_ITEM value for the
@@ -2555,74 +2299,46 @@ void request_compile(EDIT_SECTION* edit) {
         is_legacy_custom_spacing_value(japanese_spacing_raw);
     const JapaneseSpacingMode selected_japanese_spacing =
         object_japanese_spacing_value != nullptr
-        ? japanese_spacing_mode_from_serialized_value(japanese_spacing_raw)
+        ? aviutl2_latex::resolve_japanese_spacing_mode(
+            from_utf8_for_object_value(japanese_spacing_raw.c_str()))
         : japanese_spacing_mode_from_selection(japanese_spacing.value);
     const auto object_japanese_enabled_value = get_object_value_copy(
         edit, object, L"日本語対応");
-    const OwnedFontSettings owned_font_settings =
-        read_owned_font_settings(edit, object, object_id);
+    const JapaneseFontConfig japanese_font_config =
+        read_japanese_font_config(edit, object, object_id);
     const bool font_data_migration_queued =
-        owned_font_settings.needs_migration &&
-        queue_font_object_data(object_id, owned_font_settings);
+        japanese_font_config.needs_migration &&
+        queue_font_object_data(object_id, japanese_font_config);
     const bool selected_japanese_enabled = resolve_object_check(
         object_japanese_enabled_value.has_value()
             ? object_japanese_enabled_value->c_str()
             : nullptr,
         japanese_enabled.value);
-    const int selected_japanese_font_mode = owned_font_settings.mode;
-    const std::wstring selected_japanese_font_name =
-        from_utf8_for_object_value(owned_font_settings.family_name.c_str());
-    const std::wstring selected_japanese_font_file =
-        from_utf8_for_object_value(owned_font_settings.file_path.c_str());
-    const JapaneseDocumentConfiguration japanese_configuration =
-        build_japanese_document_configuration(
-            selected_template,
+    const DocumentJapaneseFontPreamble japanese_configuration =
+        selected_template == LatexTemplate::Document
+        ? aviutl2_latex::build_document_japanese_font_preamble(
             selected_japanese_enabled,
-            selected_japanese_font_mode,
-            selected_japanese_spacing,
-            selected_japanese_font_name,
-            selected_japanese_font_file);
+            japanese_font_config,
+            selected_japanese_spacing)
+        : DocumentJapaneseFontPreamble{};
     const bool japanese_font_applied =
         selected_template == LatexTemplate::Document &&
-        japanese_configuration.enabled && japanese_configuration.valid();
-    const bool latin_font_applied =
-        japanese_font_applied &&
-        japanese_configuration.font_mode != JapaneseFontMode::Default;
-    const std::wstring text_font_name =
-        latin_font_applied &&
-            japanese_configuration.font_mode == JapaneseFontMode::FontName
-        ? japanese_configuration.font_name
-        : std::wstring{};
-    const std::wstring text_font_file =
-        latin_font_applied &&
-            japanese_configuration.font_mode == JapaneseFontMode::FontFile
-        ? japanese_configuration.font_file
-        : std::wstring{};
-    std::wstring font_display_name =
-        from_utf8_for_object_value(owned_font_settings.display_name.c_str());
-    if (font_display_name.empty()) {
-        if (japanese_configuration.font_mode == JapaneseFontMode::FontName &&
-            !japanese_configuration.font_name.empty()) {
-            font_display_name = japanese_configuration.font_name;
-        } else if (
-            japanese_configuration.font_mode == JapaneseFontMode::FontFile &&
-            !japanese_configuration.font_file.empty()) {
-            font_display_name = std::filesystem::path(
-                japanese_configuration.font_file).filename().wstring();
-        } else {
-            font_display_name = L"既定";
-        }
-    }
-    const bool font_setting_fallback_used = owned_font_settings.needs_migration;
+        japanese_configuration.japanese_enabled &&
+        japanese_configuration.valid();
+    constexpr bool latin_font_applied = false;
+    const std::wstring font_display_name =
+        aviutl2_latex::japanese_font_display_value(japanese_font_config);
+    const bool font_setting_fallback_used =
+        japanese_font_config.needs_migration;
     const std::string font_setting_fallback_reason =
-        owned_font_settings.needs_migration
+        japanese_font_config.needs_migration
         ? (font_data_migration_queued
             ? "legacy_values_queued_for_hidden_data"
             : "legacy_values_hidden_data_queue_failed")
         : "none";
     const std::wstring japanese_spacing_effective_log =
         selected_template != LatexTemplate::Document ||
-            !japanese_configuration.enabled
+            !japanese_configuration.japanese_enabled
         ? L"ignored"
         : japanese_spacing_effective_name(japanese_configuration);
 
@@ -2643,7 +2359,7 @@ void request_compile(EDIT_SECTION* edit) {
         selected_template_name,
         selected_dpi,
         font_display_name,
-        japanese_configuration.font_file);
+        japanese_font_config.file_path.wstring());
     int compiled_render_dpi_before = 0;
     if (object_id >= 0) {
         std::lock_guard state_lock(state_mutex);
@@ -2723,24 +2439,26 @@ void request_compile(EDIT_SECTION* edit) {
                 : "not-applicable\n") +
         "inline_displaystyle_added: no\n"
         "japanese_enabled: " +
-            std::string(japanese_configuration.enabled ? "yes\n" : "no\n") +
+            std::string(japanese_configuration.japanese_enabled
+                ? "yes\n"
+                : "no\n") +
         "japanese_font_mode: " +
-            to_utf8_for_log(japanese_font_mode_name(
-                japanese_configuration.font_mode)) + "\n" +
+            to_utf8_for_log(aviutl2_latex::japanese_font_source_name(
+                japanese_font_config.source)) + "\n" +
         "japanese_font_name: " +
-            to_utf8_for_log(japanese_configuration.font_name) + "\n" +
+            to_utf8_for_log(japanese_font_config.fontspec_family_name) + "\n" +
         "japanese_font_file: " +
-            to_utf8_for_log(japanese_configuration.font_file) + "\n" +
+            to_utf8_for_log(japanese_font_config.file_path.wstring()) + "\n" +
         "spacing_item_raw_value: " + japanese_spacing_raw + "\n"
         "spacing_item_value_source: " +
             std::string(object_japanese_spacing_value != nullptr
                 ? "object_api\n"
                 : "filter_item_fallback\n") +
         "spacing_parsed_mode: " +
-            to_utf8_for_log(japanese_spacing_mode_name(
+            to_utf8_for_log(aviutl2_latex::japanese_spacing_mode_name(
                 selected_japanese_spacing)) + "\n" +
         "spacing_requested_mode: " +
-            to_utf8_for_log(japanese_spacing_mode_name(
+            to_utf8_for_log(aviutl2_latex::japanese_spacing_mode_name(
                 japanese_configuration.spacing_requested)) + "\n" +
         "spacing_effective_mode: " +
             to_utf8_for_log(japanese_spacing_effective_log) + "\n" +
@@ -2748,34 +2466,30 @@ void request_compile(EDIT_SECTION* edit) {
             std::string(legacy_custom_spacing_fallback ? "auto\n" : "no\n") +
         "japanese_spacing_raw: " + japanese_spacing_raw + "\n"
         "japanese_spacing_requested: " +
-            to_utf8_for_log(japanese_spacing_mode_name(
+            to_utf8_for_log(aviutl2_latex::japanese_spacing_mode_name(
                 japanese_configuration.spacing_requested)) + "\n" +
         "japanese_spacing_effective: " +
             to_utf8_for_log(japanese_spacing_effective_log) + "\n" +
         "japanese_jfm: " +
-            to_utf8_for_log(japanese_configuration.spacing_jfm) + "\n" +
+            to_utf8_for_log(japanese_configuration.jfm) + "\n" +
         "japanese_kerning: " +
-            to_utf8_for_log(japanese_configuration.spacing_kerning) + "\n" +
+            to_utf8_for_log(japanese_configuration.kerning) + "\n" +
         "japanese_palt: " +
-            std::string(japanese_configuration.spacing_palt ? "on\n" : "off\n") +
+            std::string(japanese_configuration.palt ? "on\n" : "off\n") +
         "japanese_kern_feature: " +
-            std::string(japanese_configuration.spacing_kern_feature
+            std::string(japanese_configuration.kern_feature
                 ? "on\n"
                 : "off\n") +
         "generated_jfm: " +
-            to_utf8_for_log(japanese_configuration.spacing_jfm) + "\n" +
+            to_utf8_for_log(japanese_configuration.jfm) + "\n" +
         "generated_kerning: " +
-            to_utf8_for_log(japanese_configuration.spacing_kerning) + "\n" +
+            to_utf8_for_log(japanese_configuration.kerning) + "\n" +
         "generated_script: " +
             to_utf8_for_log(japanese_configuration.generated_script) + "\n" +
         "generated_raw_features: " +
             to_utf8_for_log(
                 japanese_configuration.generated_raw_features) + "\n" +
-        "generated_setmainfont:\n" +
-            (japanese_configuration.generated_setmainfont.empty()
-                ? std::string("not-generated\n")
-                : to_utf8_for_log(
-                    japanese_configuration.generated_setmainfont)) +
+        "generated_setmainfont: not-generated (font isolation)\n"
         "generated_setmainjfont:\n" +
             (japanese_configuration.generated_setmainjfont.empty()
                 ? std::string("not-generated\n")
@@ -2786,36 +2500,42 @@ void request_compile(EDIT_SECTION* edit) {
         "font_setting_fallback_reason: " +
             font_setting_fallback_reason + "\n" +
         "font_mode: " +
-            to_utf8_for_log(japanese_font_mode_name(
-                japanese_configuration.font_mode)) + "\n" +
+            to_utf8_for_log(aviutl2_latex::japanese_font_source_name(
+                japanese_font_config.source)) + "\n" +
         "font_source_mode: " +
-            to_utf8_for_log(japanese_font_mode_name(
-                japanese_configuration.font_mode)) + "\n" +
+            to_utf8_for_log(aviutl2_latex::japanese_font_source_name(
+                japanese_font_config.source)) + "\n" +
         "font_display_name: " + to_utf8_for_log(font_display_name) + "\n" +
         "fontspec_family_name: " +
-            to_utf8_for_log(japanese_configuration.font_name) + "\n" +
+            to_utf8_for_log(japanese_font_config.fontspec_family_name) + "\n" +
         "font_file_path: " +
-            to_utf8_for_log(japanese_configuration.font_file) + "\n" +
+            to_utf8_for_log(japanese_font_config.file_path.wstring()) + "\n" +
         "font_name: " +
-            to_utf8_for_log(japanese_configuration.font_name) + "\n" +
+            to_utf8_for_log(japanese_font_config.fontspec_family_name) + "\n" +
         "font_file: " +
-            to_utf8_for_log(japanese_configuration.font_file) + "\n" +
+            to_utf8_for_log(japanese_font_config.file_path.wstring()) + "\n" +
         "normalized_font_directory: " +
             to_utf8_for_log(japanese_configuration.normalized_font_directory) + "\n" +
         "normalized_font_filename: " +
             to_utf8_for_log(japanese_configuration.normalized_font_filename) + "\n" +
         "font_file_exists: " +
-            std::string(japanese_configuration.font_file_exists ? "yes\n" : "no\n") +
+            std::string(japanese_font_config.source ==
+                    JapaneseFontSource::FontFile &&
+                japanese_configuration.valid()
+                ? "yes\n"
+                : "no\n") +
         "font_file_size: " +
             std::to_string(japanese_configuration.font_file_size) + "\n" +
         "font_file_last_write_time: " +
             to_utf8_for_log(japanese_configuration.font_file_last_write_time) + "\n" +
         "latin_font_applied: " +
             std::string(latin_font_applied ? "yes\n" : "no\n") +
+        "latin_text_font: latex-default\n"
+        "math_font: latex-default\n"
         "japanese_font_applied: " +
             std::string(japanese_font_applied ? "yes\n" : "no\n") +
-        "text_font_name: " + to_utf8_for_log(text_font_name) + "\n" +
-        "text_font_file: " + to_utf8_for_log(text_font_file) + "\n" +
+        "text_font_name: not-applied-to-latin\n"
+        "text_font_file: not-applied-to-latin\n"
         "document_display_spacing_enabled: " +
             std::string(selected_template == LatexTemplate::Document
                 ? "yes\n"
@@ -2833,13 +2553,9 @@ void request_compile(EDIT_SECTION* edit) {
                 ? "0.5baselineskip\n"
                 : "not-applicable\n") +
         "template_cache_version: " +
-            std::string(selected_template == LatexTemplate::AlignStar
-                ? kAlignRelationSpacingCacheVersion
-                : kTemplateCacheVersion) + "\n" +
+            std::string(template_cache_version(selected_template)) + "\n" +
         "cache_version: " +
-            std::string(selected_template == LatexTemplate::AlignStar
-                ? kAlignRelationSpacingCacheVersion
-                : kTemplateCacheVersion) + "\n" +
+            std::string(template_cache_version(selected_template)) + "\n" +
         "cache_key_contains_dpi: yes\n");
     if (object_id < 0) {
         append_latest_log(
@@ -2904,8 +2620,24 @@ void request_compile(EDIT_SECTION* edit) {
         return;
     }
 
-    const std::wstring source = latex_source.value != nullptr ? latex_source.value : L"";
-    const std::vector<std::wstring> steps = split_steps(source);
+    if (source_size_exceeded || source_copy_allocation_failed) {
+        append_latest_log(
+            std::string("failed_stage: ") +
+            (source_size_exceeded
+                ? "source_size_limit\n"
+                : "source_memory_allocation\n") +
+            "maximum_source_utf8_bytes: " +
+                std::to_string(kMaximumLatexSourceUtf8Bytes) + "\n"
+            "image_list_published: no\n"
+            "compile_button_finished: yes\n");
+        return;
+    }
+    std::wstring source = focused_source_value
+        ? std::move(*focused_source_value)
+        : std::wstring{};
+    const step_parser::StepParseResult parsed_steps =
+        step_parser::parse_latex_steps(source, kMaximumStepCount);
+    const std::vector<std::wstring>& steps = parsed_steps.steps;
     std::wstring persistent_cache_identity =
         L"template-id=" +
         std::to_wstring(LatexTemplateBuilder::id(selected_template)) +
@@ -2927,7 +2659,7 @@ void request_compile(EDIT_SECTION* edit) {
             std::string(selected_template == LatexTemplate::TikzPicture
                 ? std::to_string(steps.size())
                 : "not-applicable") + "\n");
-    if (steps.size() > kMaximumStepCount) {
+    if (parsed_steps.limit_exceeded) {
         append_latest_log(
             "render_success: no\n"
             "failed_stage: step_count_limit\n"
@@ -2942,9 +2674,22 @@ void request_compile(EDIT_SECTION* edit) {
     auto raw_step_layers = std::make_shared<ImageList>();
     raw_step_layers->reserve(steps.size());
     std::size_t failed_step = 0;
+    bool compile_time_limit_exceeded = false;
+    bool render_memory_limit_exceeded = false;
+    std::uint64_t raw_layer_pixel_count = 0;
     bool all_layers_from_cache = true;
 
     for (std::size_t index = 0; index < steps.size(); ++index) {
+        if (GetTickCount64() - compile_started_at >=
+            kMaximumCompileElapsedMs) {
+            append_latest_log(
+                "failed_stage: compile_timeout\n"
+                "compile_timeout_ms: " +
+                    std::to_string(kMaximumCompileElapsedMs) + "\n");
+            compile_time_limit_exceeded = true;
+            failed_step = index + 1;
+            break;
+        }
         const std::wstring layer_document =
             LatexTemplateBuilder::build_step_layer_document(
                 selected_template,
@@ -2965,12 +2710,10 @@ void request_compile(EDIT_SECTION* edit) {
                     std::wstring(alignment_name.begin(), alignment_name.end());
             }
         }
-        const char* template_cache_version =
-            selected_template == LatexTemplate::AlignStar
-            ? kAlignRelationSpacingCacheVersion
-            : kTemplateCacheVersion;
+        const char* current_template_cache_version =
+            template_cache_version(selected_template);
         const std::string layer_cache_version =
-            std::string(template_cache_version) + "-template-" +
+            std::string(current_template_cache_version) + "-template-" +
             std::to_string(LatexTemplateBuilder::id(selected_template)) + "-" +
             to_utf8_for_log(selected_template_name) + "-step-" +
             std::to_string(index + 1) + "-" +
@@ -2979,7 +2722,7 @@ void request_compile(EDIT_SECTION* edit) {
             to_utf8_for_log(tikz_configuration.cache_material);
         const std::wstring cache_identity =
             source +
-            L"\n" + widen_ascii(template_cache_version) + L"\ntemplate_id=" +
+            L"\n" + widen_ascii(current_template_cache_version) + L"\ntemplate_id=" +
             std::to_wstring(LatexTemplateBuilder::id(selected_template)) +
             L"\ntemplate_name=" + selected_template_name + L"\ntarget_step=" +
             std::to_wstring(index + 1) + L"\nrender-dpi=" +
@@ -2995,32 +2738,11 @@ void request_compile(EDIT_SECTION* edit) {
             cache_identity.find(L"japanese-spacing-requested=") !=
             std::wstring::npos;
         ImagePointer image;
-        bool invalid_cached_image = false;
+        bool disk_cache_used = false;
         append_latest_log(
             "\n[Generated " + to_utf8_for_log(selected_template_name) +
             " step layer " + std::to_string(index + 1) + "]\n" +
             to_utf8_for_log(layer_document) + "\n");
-        {
-            std::lock_guard state_lock(state_mutex);
-            auto state = object_states.find(object_id);
-            if (state != object_states.end()) {
-                auto cached = state->second.source_cache.find(cache_identity);
-                if (cached != state->second.source_cache.end()) {
-                    if (is_valid_cached_image(cached->second)) {
-                        image = cached->second;
-                    } else {
-                        state->second.source_cache.erase(cached);
-                        invalid_cached_image = true;
-                    }
-                }
-            }
-        }
-
-        if (invalid_cached_image) {
-            append_latest_log(
-                "cache_invalid: yes\n"
-                "cache_fallback: regenerate\n");
-        }
 
         append_latest_log(
             "step_index: " + std::to_string(index + 1) + "\n" +
@@ -3030,14 +2752,12 @@ void request_compile(EDIT_SECTION* edit) {
                 "|render-dpi=" + std::to_string(selected_dpi) + "\n" +
             "cache_key_contains_dpi: yes\n" +
             "cache_key_contains_spacing: " +
-                (cache_key_contains_spacing ? "yes\n" : "no\n") +
-            "cache_used: " + (image ? "yes\n" : "no\n"));
+                (cache_key_contains_spacing ? "yes\n" : "no\n"));
 
         if (!image) {
             RenderedImage rendered;
             std::uint64_t rendered_nonzero_alpha_pixels = 0;
             bool image_decoded = false;
-            bool disk_cache_used = false;
             const bool succeeded = render_latex(
                 layer_document,
                 rendered,
@@ -3066,19 +2786,38 @@ void request_compile(EDIT_SECTION* edit) {
                 break;
             }
             image = std::make_shared<const RenderedImage>(std::move(rendered));
-            {
-                std::lock_guard state_lock(state_mutex);
-                object_states[object_id].source_cache[cache_identity] = image;
-            }
         } else {
             append_latest_log("render_success: yes\n");
         }
+        append_latest_log(
+            std::string("cache_used: ") +
+            (disk_cache_used ? "yes\n" : "no\n"));
+        std::uint64_t layer_pixel_count = 0;
+        if (!image || !checked_pixel_count(
+                image->width, image->height, layer_pixel_count) ||
+            image->pixels.size() < layer_pixel_count ||
+            raw_layer_pixel_count > kMaximumCompileResidentPixelCount -
+                layer_pixel_count) {
+            append_latest_log(
+                "failed_stage: render_memory_limit\n"
+                "configured_resident_pixel_limit: " +
+                    std::to_string(kMaximumCompileResidentPixelCount) + "\n");
+            render_memory_limit_exceeded = true;
+            failed_step = index + 1;
+            break;
+        }
+        raw_layer_pixel_count += layer_pixel_count;
         raw_step_layers->push_back(std::move(image));
     }
 
     if (failed_step != 0) {
         append_latest_log(
-            "failed_stage: step_render\n"
+            std::string("failed_stage: ") +
+            (compile_time_limit_exceeded
+                ? "compile_timeout\n"
+                : (render_memory_limit_exceeded
+                    ? "render_memory_limit\n"
+                    : "step_render\n")) +
             "failed_step: " + std::to_string(failed_step) + "\n" +
             "image_list_published: no\n"
             "compiled_render_dpi_after: " +
@@ -3133,9 +2872,7 @@ void request_compile(EDIT_SECTION* edit) {
                 ? "tikz-opacity-scope-full-layout\n"
                 : "white-hidden-full-layout\n") +
         "cache_version: " +
-            std::string(selected_template == LatexTemplate::AlignStar
-                ? kAlignRelationSpacingCacheVersion
-                : kTemplateCacheVersion) + "\n");
+            std::string(template_cache_version(selected_template)) + "\n");
     if (!layers_created && !global_content_bounds.valid()) {
         append_latest_log(
             "failed_stage: global_content_bounds\n"
@@ -3303,7 +3040,11 @@ bool func_proc_video(FILTER_PROC_VIDEO* video) {
         const int step_count = step_layers
             ? static_cast<int>(step_layers->size())
             : 0;
-        double step_value = (std::clamp)(display_step.value, 0.0, static_cast<double>(step_count));
+        double step_value = std::isfinite(display_step.value)
+            ? display_step.value
+            : 0.0;
+        step_value = (std::clamp)(
+            step_value, 0.0, static_cast<double>(step_count));
         const double nearest_integer = std::round(step_value);
         if (std::abs(step_value - nearest_integer) < kStepEpsilon) {
             step_value = nearest_integer;

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -19,7 +20,9 @@
 namespace {
 
 constexpr std::uintmax_t kMaximumPngFileSize = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uintmax_t kMaximumProcessOutputBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr char kRenderCacheVersion[] = "document-source-v1";
+std::recursive_mutex latest_log_mutex;
 
 std::string to_utf8(const std::wstring& value) {
     if (value.empty()) {
@@ -78,6 +81,8 @@ void append_process_report(
     log << "command: " << to_utf8(result.command_line) << "\n";
     log << "started: " << (result.started ? "yes" : "no") << "\n";
     log << "timed_out: " << (result.timed_out ? "yes" : "no") << "\n";
+    log << "output_truncated: " <<
+        (result.output_truncated ? "yes" : "no") << "\n";
     if (result.started) {
         log << "exit_code: " << result.exit_code << "\n";
     }
@@ -90,6 +95,7 @@ void append_process_report(
 } // namespace
 
 void append_latest_log(const std::string& message) {
+    std::lock_guard log_lock(latest_log_mutex);
     AppPaths paths;
     std::wstring path_error;
     if (!resolve_app_paths(paths, path_error) ||
@@ -104,6 +110,7 @@ void append_latest_log(const std::string& message) {
 }
 
 void reset_latest_log(const std::string& message) {
+    std::lock_guard log_lock(latest_log_mutex);
     AppPaths paths;
     std::wstring path_error;
     if (!resolve_app_paths(paths, path_error) ||
@@ -138,6 +145,10 @@ bool render_latex(
     std::uint64_t* nonzero_alpha_pixels,
     bool* image_decoded,
     bool* disk_cache_used) {
+    // render_latex also streams detailed process reports directly to
+    // latest.log. Keep each render report contiguous while allowing the
+    // append helper to be called recursively from failure paths.
+    std::lock_guard log_lock(latest_log_mutex);
     const bool tikz_render = cache_version.find(
         "tikzpicture-template-monochrome-v1") != std::string::npos;
     if (nonzero_alpha_pixels != nullptr) {
@@ -240,7 +251,9 @@ bool render_latex(
         },
         work_directory,
         lualatex_log_path,
-        30000);
+        30000,
+        std::stop_token{},
+        kMaximumProcessOutputBytes);
     append_process_report(latest, "LuaLaTeX", latex_result, lualatex_log_path);
     latest.flush();
     error.clear();
@@ -271,7 +284,9 @@ bool render_latex(
         },
         work_directory,
         mutool_log_path,
-        30000);
+        30000,
+        std::stop_token{},
+        kMaximumProcessOutputBytes);
     append_process_report(latest, "MuPDF", mutool_result, mutool_log_path);
     latest.flush();
     error.clear();

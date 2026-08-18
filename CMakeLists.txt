@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AviUtl2LaTeX VERSION 0.1.1 LANGUAGES CXX)
+project(AviUtl2LaTeX VERSION 0.2.0 LANGUAGES CXX)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md" AVIUTL2_LATEX_CHANGELOG)
 if(NOT AVIUTL2_LATEX_CHANGELOG MATCHES "## ${PROJECT_VERSION}([^0-9]|$)")
@@ -36,12 +36,15 @@ add_library(AviUtl2LaTeX MODULE
     src/AppPaths.cpp
     src/AviUtl2LaTeX.cpp
     src/DialogLayout.cpp
+    src/DocumentTemplateBuilder.cpp
     src/EnvironmentDiagnostics.cpp
     src/ImageLoader.cpp
+    src/JapaneseFontConfig.cpp
     src/LatexRenderer.cpp
     src/PersistentRenderCache.cpp
     src/PluginInfo.cpp
     src/ProcessRunner.cpp
+    src/StepParser.cpp
     src/ToolSettings.cpp
     src/UiDialogs.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/Version.rc"
@@ -88,6 +91,7 @@ if(BUILD_TESTING)
         /utf-8
         /Zc:__cplusplus
         /wd4828
+        /wd4201
     )
     add_test(
         NAME persistent_render_cache_smoke
@@ -140,6 +144,104 @@ if(BUILD_TESTING)
         /W4 /permissive- /utf-8 /Zc:__cplusplus /wd4828)
     target_link_libraries(DialogLayoutSmoke PRIVATE user32)
     add_test(NAME dialog_layout_smoke COMMAND DialogLayoutSmoke)
+
+    add_executable(JapaneseFontConfigSmoke
+        tests/JapaneseFontConfigSmoke.cpp
+        src/JapaneseFontConfig.cpp
+    )
+    target_compile_features(JapaneseFontConfigSmoke PRIVATE cxx_std_20)
+    target_include_directories(JapaneseFontConfigSmoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_options(JapaneseFontConfigSmoke PRIVATE
+        /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+    add_test(NAME japanese_font_config_smoke COMMAND JapaneseFontConfigSmoke)
+    add_test(NAME font_config_migration_smoke COMMAND JapaneseFontConfigSmoke)
+    add_test(NAME cache_key_completeness_smoke COMMAND JapaneseFontConfigSmoke)
+
+    add_executable(StepParserSmoke
+        tests/StepParserSmoke.cpp
+        src/StepParser.cpp
+    )
+    target_compile_features(StepParserSmoke PRIVATE cxx_std_20)
+    target_include_directories(StepParserSmoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_options(StepParserSmoke PRIVATE
+        /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+    add_test(NAME step_parser_smoke COMMAND StepParserSmoke)
+
+    add_executable(DocumentMixedLineBreakSmoke
+        tests/DocumentMixedLineBreakSmoke.cpp
+        src/DocumentTemplateBuilder.cpp
+        src/JapaneseFontConfig.cpp
+        src/ProcessRunner.cpp
+        src/StepParser.cpp
+    )
+    target_compile_features(DocumentMixedLineBreakSmoke PRIVATE cxx_std_20)
+    target_include_directories(DocumentMixedLineBreakSmoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_options(DocumentMixedLineBreakSmoke PRIVATE
+        /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+    add_test(
+        NAME document_mixed_line_break_smoke
+        COMMAND DocumentMixedLineBreakSmoke)
+
+    add_executable(SdkStringLifetimeSmoke
+        tests/SdkStringLifetimeSmoke.cpp
+    )
+    target_compile_features(SdkStringLifetimeSmoke PRIVATE cxx_std_20)
+    target_include_directories(SdkStringLifetimeSmoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_options(SdkStringLifetimeSmoke PRIVATE
+        /W4 /WX /permissive- /utf-8 /Zc:__cplusplus /wd4828)
+    add_test(NAME sdk_string_lifetime_smoke COMMAND SdkStringLifetimeSmoke)
+
+    set(AVIUTL2_LATEX_TEST_LUALATEX "" CACHE FILEPATH
+        "LuaLaTeX executable for opt-in font isolation integration tests")
+    set(AVIUTL2_LATEX_TEST_MUTOOL "" CACHE FILEPATH
+        "mutool executable for opt-in font isolation integration tests")
+    set(AVIUTL2_LATEX_TEST_CORPORATE_FONT_FAMILY "" CACHE STRING
+        "Optional installed Corporate Logo family for font isolation tests")
+    set(AVIUTL2_LATEX_TEST_JAPANESE_FONT_FILE "" CACHE FILEPATH
+        "Optional Japanese OTF/TTF/TTC file for font isolation tests")
+    if(AVIUTL2_LATEX_TEST_LUALATEX)
+        add_test(
+            NAME document_mixed_line_break_integration
+            COMMAND DocumentMixedLineBreakSmoke
+                "${AVIUTL2_LATEX_TEST_LUALATEX}"
+                "${CMAKE_CURRENT_BINARY_DIR}/document-mixed-line-break")
+        set_tests_properties(
+            document_mixed_line_break_integration PROPERTIES
+            LABELS "latex_integration"
+            TIMEOUT 300)
+    endif()
+    if(AVIUTL2_LATEX_TEST_LUALATEX AND AVIUTL2_LATEX_TEST_MUTOOL)
+        add_executable(JapaneseMathFontIsolationSmoke
+            tests/JapaneseMathFontIsolationSmoke.cpp
+            src/JapaneseFontConfig.cpp
+            src/ProcessRunner.cpp
+        )
+        target_compile_features(JapaneseMathFontIsolationSmoke PRIVATE cxx_std_20)
+        target_include_directories(JapaneseMathFontIsolationSmoke PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        )
+        target_compile_options(JapaneseMathFontIsolationSmoke PRIVATE
+            /W4 /WX /permissive- /utf-8 /Zc:__cplusplus)
+        add_test(
+            NAME japanese_math_font_isolation_smoke
+            COMMAND JapaneseMathFontIsolationSmoke
+                "${AVIUTL2_LATEX_TEST_LUALATEX}"
+                "${AVIUTL2_LATEX_TEST_MUTOOL}"
+                "${CMAKE_CURRENT_BINARY_DIR}/japanese-math-font-isolation"
+                "${AVIUTL2_LATEX_TEST_CORPORATE_FONT_FAMILY}"
+                "${AVIUTL2_LATEX_TEST_JAPANESE_FONT_FILE}")
+        set_tests_properties(japanese_math_font_isolation_smoke PROPERTIES
+            LABELS "latex_integration"
+            TIMEOUT 180)
+    endif()
 endif()
 
 set_target_properties(AviUtl2LaTeX PROPERTIES

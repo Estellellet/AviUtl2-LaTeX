@@ -31,6 +31,14 @@ int wmain() {
             UserErrorCategory::LuaLaTeXNotFound ||
         classify_user_error(L"tikz_image_limit", L"") !=
             UserErrorCategory::ImageTooLarge ||
+        classify_user_error(L"image_memory_allocation", L"") !=
+            UserErrorCategory::ImageLoadFailed ||
+        classify_user_error(L"source_size_limit", L"") !=
+            UserErrorCategory::InvalidSetting ||
+        classify_user_error(L"render_memory_limit", L"") !=
+            UserErrorCategory::ImageTooLarge ||
+        classify_user_error(L"compile_timeout", L"") !=
+            UserErrorCategory::TimedOut ||
         classify_user_error(L"latex_compile", L"font not loadable") !=
             UserErrorCategory::FontNotFound ||
         classify_user_error(L"japanese_font_configuration",

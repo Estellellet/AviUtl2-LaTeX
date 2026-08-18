@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <vector>
 
 namespace {
@@ -42,7 +43,8 @@ bool load_and_process_png(
     IWICFormatConverter* converter = nullptr;
 
     bool succeeded = false;
-    do {
+    try {
+        do {
         stats.failure_stage = "wic_factory_creation";
         if (FAILED(CoCreateInstance(
                 CLSID_WICImagingFactory,
@@ -184,8 +186,17 @@ bool load_and_process_png(
             }
         }
         stats.failure_stage.clear();
-        succeeded = true;
-    } while (false);
+            succeeded = true;
+        } while (false);
+    } catch (const std::bad_alloc&) {
+        image = {};
+        succeeded = false;
+        try {
+            stats.failure_stage = "image_memory_allocation";
+        } catch (...) {
+            // Keep COM cleanup deterministic even if the diagnostic string cannot allocate.
+        }
+    }
 
     release_com(converter);
     release_com(frame);

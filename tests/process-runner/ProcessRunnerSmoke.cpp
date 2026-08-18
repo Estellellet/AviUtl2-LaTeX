@@ -41,8 +41,11 @@ int wmain(int argc, wchar_t** argv) {
     const auto ping = system_executable(L"ping.exe");
     const auto findstr = system_executable(L"findstr.exe");
     const auto root = std::filesystem::temp_directory_path() /
-        L"AviUtl2LaTeX-ProcessRunnerSmoke";
+        (L"AviUtl2LaTeX-ProcessRunnerSmoke-" +
+            std::to_wstring(GetCurrentProcessId()));
     std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
     std::filesystem::create_directories(root, error);
     if (error || !std::filesystem::is_regular_file(ping) ||
         !std::filesystem::is_regular_file(findstr)) {

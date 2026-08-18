@@ -6,13 +6,16 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
-#include <iterator>
+#include <new>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 #include "AppPaths.h"
 
 namespace {
+
+constexpr std::uintmax_t kMaximumSettingsFileSize = 1024ULL * 1024ULL;
 
 std::string to_utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -177,29 +180,65 @@ bool load_tool_settings(ToolSettings& settings, std::wstring& error) {
     AppPaths paths;
     if (!resolve_app_paths(paths, error) || !ensure_runtime_directories(paths, error)) return false;
     std::error_code code;
-    if (!std::filesystem::exists(paths.settings_file, code)) return true;
-    std::ifstream input(paths.settings_file, std::ios::binary);
-    const std::string json((std::istreambuf_iterator<char>(input)), {});
-    std::wstring environment;
-    std::wstring lualatex;
-    std::wstring mutool;
-    if (!input.good() && !input.eof() || json.empty() ||
-        !json_string(json, "tex_environment", environment) ||
-        !json_string(json, "lualatex_path", lualatex) ||
-        !json_string(json, "mutool_path", mutool)) {
+    const bool settings_exist = std::filesystem::exists(paths.settings_file, code);
+    if (code) {
+        error = L"settings.jsonの存在を確認できません";
+        return false;
+    }
+    if (!settings_exist) return true;
+
+    const std::uintmax_t file_size =
+        std::filesystem::file_size(paths.settings_file, code);
+    const bool invalid_size = code || file_size == 0 ||
+        file_size > kMaximumSettingsFileSize;
+    bool invalid_contents = invalid_size;
+    ToolSettings loaded;
+    try {
+        if (!invalid_size) {
+            std::ifstream input(paths.settings_file, std::ios::binary);
+            std::string json(static_cast<std::size_t>(file_size), '\0');
+            if (!input ||
+                (file_size != 0 &&
+                    !input.read(json.data(), static_cast<std::streamsize>(file_size))) ||
+                static_cast<std::uintmax_t>(input.gcount()) != file_size ||
+                input.peek() != std::char_traits<char>::eof()) {
+                invalid_contents = true;
+            } else {
+                std::wstring environment;
+                std::wstring lualatex;
+                std::wstring mutool;
+                invalid_contents =
+                    !json_string(json, "tex_environment", environment) ||
+                    !json_string(json, "lualatex_path", lualatex) ||
+                    !json_string(json, "mutool_path", mutool);
+                if (!invalid_contents) {
+                    loaded.tex_environment = tex_environment_from_name(environment);
+                    loaded.lualatex_path = std::move(lualatex);
+                    loaded.mutool_path = std::move(mutool);
+                    json_string(json, "last_lualatex_version", loaded.last_lualatex_version);
+                    json_string(json, "last_mutool_version", loaded.last_mutool_version);
+                    json_string(json, "last_diagnostic_summary", loaded.last_diagnostic_summary);
+                    json_string(json, "last_diagnostic_details", loaded.last_diagnostic_details);
+                }
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        settings = {};
+        error = L"settings.jsonを読み込むメモリが不足しています";
+        return false;
+    }
+
+    if (invalid_contents) {
         const auto broken = paths.settings_file.wstring() + L".broken-" + timestamp();
+        code.clear();
         std::filesystem::rename(paths.settings_file, broken, code);
         settings = {};
-        error = L"壊れたsettings.jsonを退避し、既定値へ戻しました";
+        error = invalid_size
+            ? L"大きすぎるか壊れたsettings.jsonを退避し、既定値へ戻しました"
+            : L"壊れたsettings.jsonを退避し、既定値へ戻しました";
         return true;
     }
-    settings.tex_environment = tex_environment_from_name(environment);
-    settings.lualatex_path = lualatex;
-    settings.mutool_path = mutool;
-    json_string(json, "last_lualatex_version", settings.last_lualatex_version);
-    json_string(json, "last_mutool_version", settings.last_mutool_version);
-    json_string(json, "last_diagnostic_summary", settings.last_diagnostic_summary);
-    json_string(json, "last_diagnostic_details", settings.last_diagnostic_details);
+    settings = std::move(loaded);
     return true;
 }
 

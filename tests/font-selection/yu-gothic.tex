@@ -1,8 +1,7 @@
 \documentclass{article}
-\usepackage{fontspec}
+\usepackage[no-math]{fontspec}
 \usepackage{luatexja}
 \usepackage{luatexja-fontspec}
-\setmainfont{Yu Gothic}
 \setmainjfont[
   YokoFeatures={JFM=propw},
   Kerning=On,
@@ -11,4 +10,5 @@
 ]{Yu Gothic}
 \begin{document}
 日本語 ABC 123
+\[\lim_{x\to0}\frac{\sin x}{x}=1\]
 \end{document}
