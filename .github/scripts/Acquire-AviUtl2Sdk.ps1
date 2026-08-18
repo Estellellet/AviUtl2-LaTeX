@@ -62,7 +62,23 @@ $actualSha256 = (Get-FileHash -LiteralPath $archiveFullPath -Algorithm SHA256).H
 $expectedSha256Upper = $ExpectedSha256.ToUpperInvariant()
 Write-Host "Archive SHA-256: $actualSha256"
 if ($actualSha256 -ne $expectedSha256Upper) {
-    throw "AviUtl2 SDK SHA-256 mismatch. Expected '$expectedSha256Upper', actual '$actualSha256'."
+    # Keep this script ASCII-compatible so Windows PowerShell 5.1 can parse it
+    # even when the repository stores it as UTF-8 without a BOM.
+    $sdkUpdatedHint = -join @(
+        0x516C, 0x5F0F, 0x0053, 0x0044, 0x004B, 0x304C, 0x66F4,
+        0x65B0, 0x3055, 0x308C, 0x305F, 0x53EF, 0x80FD, 0x6027,
+        0x304C, 0x3042, 0x308A, 0x307E, 0x3059, 0x3002 |
+            ForEach-Object { [char]$_ }
+    )
+    $mismatchMessage = @(
+        'AviUtl2 SDK SHA-256 mismatch.'
+        "Pinned SDK version: $Version"
+        "Expected SHA-256: $expectedSha256Upper"
+        "Actual SHA-256: $actualSha256"
+        "Official URL: $SourceUrl"
+        "$sdkUpdatedHint Verify the official distribution and update the pin manually."
+    ) -join [System.Environment]::NewLine
+    throw $mismatchMessage
 }
 
 New-Item -ItemType Directory -Force -Path $extractDirectory | Out-Null
